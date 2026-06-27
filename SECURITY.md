@@ -5,9 +5,15 @@
 - `.env`
 - Gemini API keys
 - `APP_PASSWORD`
-- Real customer/product Excel template files
+- Real customer/product Excel template files, unless the repository is private and the user explicitly approves including them
 - Generated Excel output files
 - Logs containing operational metadata
+
+## Current Handoff Decision
+
+The user approved including real workbook data for Claude/GitHub handoff. Treat any repository containing `template.xlsx` as private/confidential.
+
+Still do not commit `.env`, Gemini API keys, passwords, generated Excel files, or logs.
 
 ## Recommended Deployment
 

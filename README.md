@@ -23,9 +23,9 @@ Japanese voice/photo input web app for generating inquiry Excel files from an ex
 
 ## Required Local Files
 
-The real Excel template is intentionally not committed.
+This handoff repository may include the real Excel template as `template.xlsx` because the user explicitly approved sharing the operational workbook data for handoff.
 
-Put the workbook at:
+If `template.xlsx` is not present, put the workbook at:
 
 ```text
 template.xlsx
@@ -38,6 +38,8 @@ INQUIRY_TEMPLATE=C:\secure\path\template.xlsx
 ```
 
 in `.env`.
+
+Keep repositories containing `template.xlsx` private unless the user explicitly approves publishing the workbook data.
 
 ## Setup
 

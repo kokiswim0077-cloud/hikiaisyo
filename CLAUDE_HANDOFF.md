@@ -87,11 +87,12 @@ Frontend:
 Do not commit:
 
 - `.env`
-- real `template.xlsx`
 - generated Excel files
 - logs
 
-The real workbook contains customer/product/business data. Keep it outside GitHub unless the repository is private and explicitly approved.
+The user explicitly approved including the real workbook data for this handoff. Therefore `template.xlsx` may be committed, but the GitHub repository must be treated as private/confidential unless the user separately approves public release.
+
+Still do not commit API keys, passwords, `.env`, generated Excel files, or logs.
 
 ## Excel Mapping
 

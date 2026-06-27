@@ -1,0 +1,1116 @@
+from __future__ import annotations
+
+import json
+import base64
+import logging
+import mimetypes
+import os
+import re
+import secrets
+import shutil
+import time
+import unicodedata
+from datetime import datetime, timedelta
+from difflib import SequenceMatcher
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from urllib import request
+
+from flask import Flask, Response, jsonify, request as flask_request, send_file
+from openpyxl import load_workbook
+
+
+BASE_DIR = Path(__file__).resolve().parent
+SOURCE_BOOK = Path(os.getenv("INQUIRY_TEMPLATE", str(BASE_DIR / "template.xlsx")))
+OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", r"C:\Users\koki0\outputs\inquiry_voice_form"))
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR = Path(os.getenv("LOG_DIR", str(BASE_DIR / "logs")))
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_local_env() -> None:
+    env_path = BASE_DIR / ".env"
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_local_env()
+
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_UPLOAD_MB", "12")) * 1024 * 1024
+
+audit_logger = logging.getLogger("audit")
+audit_logger.setLevel(logging.INFO)
+audit_handler = RotatingFileHandler(
+    LOG_DIR / "audit.log",
+    maxBytes=int(os.getenv("AUDIT_LOG_MAX_BYTES", "1048576")),
+    backupCount=int(os.getenv("AUDIT_LOG_BACKUPS", "10")),
+    encoding="utf-8",
+)
+audit_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+if not audit_logger.handlers:
+    audit_logger.addHandler(audit_handler)
+
+RATE_BUCKETS: dict[tuple[str, str], list[float]] = {}
+DOWNLOAD_TOKENS: dict[str, tuple[Path, float]] = {}
+LAST_CLEANUP = 0.0
+ALLOWED_UPLOAD_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".pdf"}
+ALLOWED_UPLOAD_MIME_PREFIXES = ("image/",)
+ALLOWED_UPLOAD_MIME_TYPES = {"application/pdf"}
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def client_ip() -> str:
+    if env_bool("TRUST_PROXY_HEADERS", True):
+        cf_ip = flask_request.headers.get("CF-Connecting-IP")
+        if cf_ip:
+            return cf_ip
+        forwarded_for = flask_request.headers.get("X-Forwarded-For", "")
+        if forwarded_for:
+            return forwarded_for.split(",", 1)[0].strip()
+    return flask_request.remote_addr or "unknown"
+
+
+def audit(event: str, **fields: object) -> None:
+    safe_fields = {"event": event, "ip": client_ip(), "path": flask_request.path, **fields}
+    audit_logger.info(json.dumps(safe_fields, ensure_ascii=False, default=str))
+
+
+def cleanup_expired_files() -> None:
+    global LAST_CLEANUP
+    now = time.time()
+    if now - LAST_CLEANUP < 300:
+        return
+    LAST_CLEANUP = now
+    retention_seconds = int(os.getenv("OUTPUT_RETENTION_MINUTES", "120")) * 60
+    for token, (path, expires_at) in list(DOWNLOAD_TOKENS.items()):
+        if expires_at <= now:
+            DOWNLOAD_TOKENS.pop(token, None)
+    for path in OUTPUT_DIR.glob("*.xlsx"):
+        try:
+            if now - path.stat().st_mtime > retention_seconds:
+                path.unlink()
+                audit_logger.info(json.dumps({"event": "cleanup_deleted", "path": str(path)}, ensure_ascii=False))
+        except OSError as exc:
+            audit_logger.warning(json.dumps({"event": "cleanup_failed", "path": str(path), "error": str(exc)}, ensure_ascii=False))
+
+
+def rate_limit_key() -> str:
+    if flask_request.path == "/api/parse-image":
+        return "image"
+    if flask_request.path == "/api/parse":
+        return "parse"
+    if flask_request.path == "/api/save":
+        return "save"
+    if flask_request.path.startswith("/download/"):
+        return "download"
+    return "default"
+
+
+def rate_limit_config(bucket: str) -> tuple[int, int]:
+    configs = {
+        "image": (int(os.getenv("RATE_IMAGE_COUNT", "12")), int(os.getenv("RATE_IMAGE_WINDOW", "600"))),
+        "parse": (int(os.getenv("RATE_PARSE_COUNT", "60")), int(os.getenv("RATE_PARSE_WINDOW", "60"))),
+        "save": (int(os.getenv("RATE_SAVE_COUNT", "30")), int(os.getenv("RATE_SAVE_WINDOW", "60"))),
+        "download": (int(os.getenv("RATE_DOWNLOAD_COUNT", "60")), int(os.getenv("RATE_DOWNLOAD_WINDOW", "60"))),
+        "default": (int(os.getenv("RATE_DEFAULT_COUNT", "180")), int(os.getenv("RATE_DEFAULT_WINDOW", "60"))),
+    }
+    return configs.get(bucket, configs["default"])
+
+
+def is_rate_limited() -> bool:
+    bucket = rate_limit_key()
+    limit, window = rate_limit_config(bucket)
+    key = (client_ip(), bucket)
+    now = time.time()
+    timestamps = [ts for ts in RATE_BUCKETS.get(key, []) if now - ts < window]
+    if len(timestamps) >= limit:
+        RATE_BUCKETS[key] = timestamps
+        audit("rate_limited", bucket=bucket, limit=limit, window=window)
+        return True
+    timestamps.append(now)
+    RATE_BUCKETS[key] = timestamps
+    return False
+
+
+def request_is_https() -> bool:
+    if flask_request.is_secure:
+        return True
+    return flask_request.headers.get("X-Forwarded-Proto", "").lower() == "https"
+
+
+def app_password() -> str:
+    return os.getenv("APP_PASSWORD", "")
+
+
+def is_authenticated() -> bool:
+    password = app_password()
+    if not password:
+        return True
+    auth = flask_request.authorization
+    return bool(auth and auth.username == "user" and secrets.compare_digest(auth.password or "", password))
+
+
+@app.before_request
+def require_app_password():
+    cleanup_expired_files()
+    if env_bool("PUBLIC_MODE", False) and not app_password():
+        return jsonify({"error": "APP_PASSWORD is required in PUBLIC_MODE"}), 503
+    if env_bool("REQUIRE_HTTPS", False) and not request_is_https():
+        audit("blocked_non_https")
+        return jsonify({"error": "HTTPS required"}), 403
+    if is_rate_limited():
+        return jsonify({"error": "Too many requests. Please wait and retry."}), 429
+    if flask_request.path == "/api/status" and not env_bool("PUBLIC_MODE", False):
+        return None
+    if is_authenticated():
+        return None
+    audit("auth_failed")
+    return Response(
+        "Authentication required",
+        401,
+        {"WWW-Authenticate": 'Basic realm="Inquiry Voice Form"'},
+    )
+
+
+def today() -> datetime:
+    return datetime.now()
+
+
+def add_business_days(start: datetime, days: int) -> datetime:
+    current = start
+    added = 0
+    while added < days:
+        current += timedelta(days=1)
+        if current.weekday() < 5:
+            added += 1
+    return current
+
+
+def date_from_iso(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def normalize(value: object) -> str:
+    text = "" if value is None else str(value)
+    text = unicodedata.normalize("NFKC", text)
+    text = text.lower()
+    return re.sub(r"[\s　・･()（）株式会社有限会社㈱㈲\-_/.,、。]+", "", text)
+
+
+def load_master_data() -> dict[str, list[dict[str, object]]]:
+    wb = load_workbook(SOURCE_BOOK, read_only=True, data_only=True)
+
+    customers: list[dict[str, object]] = []
+    for code, name, kana, rate, *_ in wb["請求先"].iter_rows(min_row=2, values_only=True):
+        if code and name:
+            customers.append(
+                {
+                    "code": str(code),
+                    "name": str(name).strip(),
+                    "kana": "" if kana is None else str(kana).strip(),
+                    "rate": rate,
+                }
+            )
+
+    deliveries: list[dict[str, object]] = []
+    for code, kana, name, postal, address, tel, *_ in wb["出荷先"].iter_rows(min_row=2, values_only=True):
+        if code and name:
+            deliveries.append(
+                {
+                    "code": str(code),
+                    "name": str(name).strip(),
+                    "kana": "" if kana is None else str(kana).strip(),
+                    "postal": "" if postal is None else str(postal).strip(),
+                    "address": "" if address is None else str(address).strip(),
+                    "tel": "" if tel is None else str(tel).strip(),
+                }
+            )
+
+    products: list[dict[str, object]] = []
+    for code, name, price, *_ in wb["商品コード"].iter_rows(min_row=10, values_only=True):
+        if code and name:
+            products.append({"code": str(code), "name": str(name).strip(), "price": price})
+
+    return {"customers": customers, "deliveries": deliveries, "products": products}
+
+
+MASTER = load_master_data()
+
+
+def best_match(query: str, rows: list[dict[str, object]], keys: tuple[str, ...]) -> dict[str, object] | None:
+    candidates = ranked_matches(query, rows, keys, limit=1)
+    return candidates[0] if candidates else None
+
+
+def ranked_matches(
+    query: str,
+    rows: list[dict[str, object]],
+    keys: tuple[str, ...],
+    limit: int = 8,
+) -> list[dict[str, object]]:
+    q = normalize(query)
+    if not q:
+        return []
+
+    scored: list[dict[str, object]] = []
+    for row in rows:
+        haystacks = [normalize(row.get(key, "")) for key in keys]
+        score = 0.0
+        for hay in haystacks:
+            if not hay:
+                continue
+            if q == hay:
+                score = max(score, 1.0)
+            elif q in hay or hay in q:
+                score = max(score, 0.92)
+            else:
+                score = max(score, SequenceMatcher(None, q, hay).ratio())
+        if score >= 0.45:
+            result = dict(row)
+            result["score"] = round(score, 3)
+            scored.append(result)
+
+    scored.sort(key=lambda item: item["score"], reverse=True)
+    return scored[:limit]
+
+
+def needs_confirmation(candidates: list[dict[str, object]]) -> bool:
+    if len(candidates) < 2:
+        return False
+    top = float(candidates[0].get("score", 0))
+    second = float(candidates[1].get("score", 0))
+    if top - second <= 0.12:
+        return True
+    top_name = normalize(candidates[0].get("name", ""))
+    for candidate in candidates[1:4]:
+        name = normalize(candidate.get("name", ""))
+        if top_name and name and (top_name in name or name in top_name):
+            return True
+    return False
+
+
+def extract_after_keyword(text: str, keywords: list[str], stops: list[str]) -> str:
+    fragment = extract_labeled_fragment(text, keywords, stops)
+    return "" if fragment is None else fragment
+
+
+def extract_labeled_fragment(text: str, keywords: list[str], stops: list[str]) -> str | None:
+    for keyword in keywords:
+        m = re.search(keyword, text)
+        if not m:
+            continue
+        tail = text[m.end() :]
+        stop_positions = [tail.find(stop) for stop in stops if tail.find(stop) >= 0]
+        if stop_positions:
+            tail = tail[: min(stop_positions)]
+        return tail.strip(" 、。,.")
+    return None
+
+
+def clean_query_fragment(value: str) -> str:
+    value = re.sub(r"^[、。\s,]+", "", value)
+    parts = [part.strip() for part in re.split(r"[、。\n,]", value) if part.strip()]
+    return parts[0] if parts else value.strip()
+
+
+def infer_product_query(text: str) -> str:
+    explicit = extract_after_keyword(
+        text,
+        ["製品", "商品", "品番", "型式", "機種"],
+        ["数量", "倉庫", "値引", "受注日", "日中日", "注文日", "出荷希望日", "出荷日"],
+    )
+    explicit = clean_query_fragment(explicit)
+    if explicit:
+        return explicit
+
+    tokens = [token.strip() for token in re.split(r"[、。\s,\n]+", text) if token.strip()]
+    best_token = ""
+    best_score = 0.0
+    for token in tokens:
+        normalized = unicodedata.normalize("NFKC", token).upper()
+        if not re.search(r"[A-Z]", normalized) or not re.search(r"\d", normalized):
+            continue
+        candidates = ranked_matches(normalized, MASTER["products"], ("name", "code"), limit=1)
+        if candidates and float(candidates[0].get("score", 0)) > best_score:
+            best_token = normalized
+            best_score = float(candidates[0].get("score", 0))
+    return best_token if best_score >= 0.65 else ""
+
+
+def parse_date(text: str, label_patterns: list[str]) -> str:
+    fragment = extract_labeled_fragment(
+        text,
+        label_patterns,
+        ["得意先", "特異先", "納入先", "倉庫", "値引", "製品", "商品", "受注日", "日中日", "注文日", "出荷希望日", "出荷日"],
+    )
+    if fragment is None:
+        return ""
+    base = today()
+    target = fragment
+    if "明後日" in target or "あさって" in target:
+        return (base + timedelta(days=2)).strftime("%Y-%m-%d")
+    if "明日" in target:
+        return (base + timedelta(days=1)).strftime("%Y-%m-%d")
+    if "今日" in target or "本日" in target:
+        return base.strftime("%Y-%m-%d")
+
+    m = re.search(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})", target)
+    if m:
+        return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    m = re.search(r"(\d{1,2})月(\d{1,2})日", target)
+    if m:
+        return f"{base.year:04d}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"
+    return ""
+
+
+def resolve_default_dates(parsed: dict[str, object]) -> dict[str, object]:
+    result = dict(parsed)
+    if not result.get("order_date"):
+        result["order_date"] = today().strftime("%Y-%m-%d")
+
+    production_date = str(result.get("production_date") or "")
+    ship_date = str(result.get("ship_date") or "")
+    production_dt = date_from_iso(production_date)
+    if not ship_date and production_dt:
+        result["ship_date"] = add_business_days(production_dt, 2).strftime("%Y-%m-%d")
+    return result
+
+
+def sanitize_parsed(parsed: dict[str, object]) -> dict[str, object]:
+    result = dict(parsed)
+    if result.get("warehouse") not in {"011", "031", ""}:
+        result["warehouse"] = ""
+    if result.get("discount_method") not in {"外掛", "内掛", ""}:
+        text = str(result.get("discount_method") or "")
+        if re.search(r"外掛|外がけ|外掛け|外書き", text):
+            result["discount_method"] = "外掛"
+        elif re.search(r"内掛|内がけ|内掛け|内書き", text):
+            result["discount_method"] = "内掛"
+        else:
+            result["discount_method"] = ""
+    rate = str(result.get("discount_rate") or "")
+    m = re.search(r"\d+(?:\.\d+)?", rate)
+    result["discount_rate"] = m.group(0) if m else ""
+    try:
+        result["quantity"] = int(result.get("quantity") or 1)
+    except (TypeError, ValueError):
+        result["quantity"] = 1
+    return result
+
+
+def local_parse(text: str) -> dict[str, object]:
+    compact = unicodedata.normalize("NFKC", text)
+    stops = ["受注日", "日中日", "注文日", "出荷希望日", "出荷日", "納入先", "倉庫", "値引", "製品", "商品", "品番", "型式", "機種", "数量"]
+
+    customer_query = clean_query_fragment(extract_after_keyword(compact, ["得意先", "特異先", "取引先", "お客"], stops))
+    delivery_query = clean_query_fragment(extract_after_keyword(compact, ["納入先", "出荷先"], stops))
+    if delivery_query in {"得意先", "特異先"}:
+        delivery_query = ""
+    product_query = infer_product_query(compact)
+
+    warehouse = ""
+    m = re.search(r"倉庫\s*(0?\d{2,3})", compact)
+    if m:
+        warehouse = m.group(1).zfill(3)
+    if warehouse not in {"011", "031"}:
+        warehouse = "011" if "011" in compact else ("031" if "031" in compact else "")
+
+    discount_method = ""
+    if re.search(r"外掛|外がけ|外掛け|外書き", compact):
+        discount_method = "外掛"
+    elif re.search(r"内掛|内がけ|内掛け|内書き", compact):
+        discount_method = "内掛"
+
+    discount_rate = ""
+    m = re.search(r"(\d+(?:\.\d+)?)\s*%", compact)
+    if not m:
+        m = re.search(r"値引(?:き|率)?\s*(\d+(?:\.\d+)?)", compact)
+    if m:
+        discount_rate = m.group(1)
+
+    discount_name = ""
+    for name in ["実演機対応値引", "実演機値引", "展示機値引", "不需要期値引", "早期確注値引", "台数値引", "推進値引", "展示会値引"]:
+        if name in compact or name.replace("値引", "値引き") in compact:
+            discount_name = name
+            break
+
+    quantity = 1
+    m = re.search(r"(?:数量\s*)?(\d+)\s*(?:台|個|本|枚)", compact)
+    if m:
+        quantity = int(m.group(1))
+
+    return {
+        "customer_query": customer_query,
+        "delivery_query": delivery_query,
+        "order_date": parse_date(compact, ["受注日", "日中日", "注文日"]),
+        "production_date": parse_date(compact, ["生産日", "生産", "製造日"]),
+        "ship_date": parse_date(compact, ["出荷希望日", "出荷日", "希望日"]),
+        "warehouse": warehouse,
+        "discount_name": discount_name,
+        "discount_method": discount_method,
+        "discount_rate": discount_rate,
+        "product_query": product_query,
+        "quantity": quantity,
+    }
+
+
+def parse_with_gemini(text: str, api_key: str) -> dict[str, object] | None:
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    prompt = f"""
+日本語の音声認識テキストから、引合書入力用の項目をJSONだけで抽出してください。
+不明な項目は空文字にしてください。日付は今日={today().strftime('%Y-%m-%d')}を基準にYYYY-MM-DDへ変換してください。
+キー:
+customer_query, delivery_query, order_date, production_date, ship_date, warehouse, discount_name, discount_method, discount_rate, product_query, quantity
+discount_methodは外掛または内掛。音声誤認識の「内書き」は内掛として扱ってください。warehouseは011または031。discount_rateは3%なら3。
+
+テキスト:
+{text}
+""".strip()
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"responseMimeType": "application/json"},
+    }
+    req = request.Request(
+        endpoint,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+        method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=20) as res:
+            data = json.loads(res.read().decode("utf-8"))
+        text_part = data["candidates"][0]["content"]["parts"][0]["text"]
+        return json.loads(text_part)
+    except Exception:
+        return None
+
+
+def parse_image_with_gemini(image_bytes: bytes, filename: str, api_key: str) -> dict[str, object] | None:
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    mime_type = mimetypes.guess_type(filename)[0] or "image/jpeg"
+    prompt = f"""
+注文書・発注書の画像を読み取り、引合書入力用の項目をJSONだけで抽出してください。
+読み取れない項目は空文字にしてください。日付は今日={today().strftime('%Y-%m-%d')}を基準にYYYY-MM-DDへ正規化してください。
+品名・型式・品番から製品候補を読み取ってください。得意先と納入先が同じとは限りません。
+
+キー:
+customer_query, delivery_query, order_date, production_date, ship_date, warehouse, discount_name, discount_method, discount_rate, product_query, quantity, order_no
+
+warehouseは011または031。不明なら空文字。
+discount_methodは外掛または内掛。不明なら空文字。
+discount_nameは台数値引、不需要期値引、実演機対応値引などの値引名。不明なら空文字。
+discount_rateは3%なら3。
+quantityは数値。
+""".strip()
+    body = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inlineData": {
+                            "mimeType": mime_type,
+                            "data": base64.b64encode(image_bytes).decode("ascii"),
+                        }
+                    },
+                ]
+            }
+        ],
+        "generationConfig": {"responseMimeType": "application/json"},
+    }
+    req = request.Request(
+        endpoint,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+        method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=45) as res:
+            data = json.loads(res.read().decode("utf-8"))
+        text_part = data["candidates"][0]["content"]["parts"][0]["text"]
+        return json.loads(text_part)
+    except Exception:
+        return None
+
+
+def resolve_fields(parsed: dict[str, object]) -> dict[str, object]:
+    parsed = sanitize_parsed(parsed)
+    parsed = resolve_default_dates(parsed)
+    customer_candidates = ranked_matches(
+        str(parsed.get("customer_query", "")),
+        MASTER["customers"],
+        ("name", "kana", "code"),
+    )
+    customer = customer_candidates[0] if customer_candidates else None
+    delivery_query = str(parsed.get("delivery_query", ""))
+    if delivery_query:
+        delivery_candidates = ranked_matches(delivery_query, MASTER["deliveries"], ("name", "kana", "code", "address"))
+    elif customer:
+        delivery_candidates = [
+            {**row, "score": 1.0}
+            for row in MASTER["deliveries"]
+            if str(row.get("code")) == str(customer.get("code"))
+        ]
+    else:
+        delivery_candidates = []
+    delivery = delivery_candidates[0] if delivery_candidates else None
+    product_candidates = ranked_matches(str(parsed.get("product_query", "")), MASTER["products"], ("name", "code"))
+    product = product_candidates[0] if product_candidates else None
+
+    return {
+        **parsed,
+        "customer": customer,
+        "customer_candidates": customer_candidates,
+        "customer_needs_confirmation": needs_confirmation(customer_candidates),
+        "delivery": delivery,
+        "delivery_candidates": delivery_candidates,
+        "delivery_needs_confirmation": needs_confirmation(delivery_candidates),
+        "product": product,
+        "product_candidates": product_candidates,
+        "product_needs_confirmation": needs_confirmation(product_candidates),
+        "warehouse": parsed.get("warehouse") or "011",
+        "discount_method": parsed.get("discount_method") or "外掛",
+        "discount_rate": parsed.get("discount_rate") or "0",
+        "quantity": parsed.get("quantity") or 1,
+    }
+
+
+def save_excel(fields: dict[str, object]) -> Path:
+    fields = resolve_default_dates(fields)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = OUTPUT_DIR / f"引合書_{stamp}.xlsx"
+    shutil.copy2(SOURCE_BOOK, output_path)
+    wb = load_workbook(output_path)
+    ws = wb["引合書+値引"]
+
+    customer = fields.get("customer") or {}
+    delivery = fields.get("delivery") or {}
+    product = fields.get("product") or {}
+
+    ws["A4"] = customer.get("code", "")
+    ws["A6"] = delivery.get("code", customer.get("code", ""))
+    ws["I4"] = fields.get("order_date") or today().strftime("%Y-%m-%d")
+    ws["H5"] = fields.get("production_date") or "在庫"
+    ws["I6"] = fields.get("ship_date") or ""
+    ws["B17"] = fields.get("warehouse") or "011"
+    ws["L7"] = fields.get("discount_name") or "音声入力値引"
+    ws["L8"] = fields.get("discount_method") or "外掛"
+    ws["N8"] = float(fields.get("discount_rate") or 0)
+    ws["A11"] = product.get("code", "")
+    ws["E11"] = int(fields.get("quantity") or 1)
+    ws["I11"] = fields.get("order_no", "")
+
+    ws["I4"].number_format = "yyyy-mm-dd"
+    ws["H5"].number_format = "yyyy-mm-dd" if fields.get("production_date") else "@"
+    ws["I6"].number_format = "yyyy-mm-dd"
+    ws["B17"].number_format = "@"
+    ws["N8"].number_format = "0.0"
+
+    try:
+        wb.calculation.fullCalcOnLoad = True
+        wb.calculation.forceFullCalc = True
+    except Exception:
+        pass
+    wb.save(output_path)
+    return output_path
+
+
+def create_download_token(path: Path) -> str:
+    token = secrets.token_urlsafe(32)
+    expires_at = time.time() + int(os.getenv("DOWNLOAD_TOKEN_MINUTES", "60")) * 60
+    DOWNLOAD_TOKENS[token] = (path, expires_at)
+    return token
+
+
+HTML = """
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>引合書 音声入力フォーム</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0; background: #f5f7fb; color: #172033; }
+    main { max-width: 1100px; margin: 0 auto; padding: 28px; }
+    h1 { font-size: 26px; margin: 0 0 18px; }
+    .panel { background: white; border: 1px solid #d9e2ef; border-radius: 8px; padding: 18px; margin-bottom: 16px; }
+    textarea { width: 100%; min-height: 96px; font-size: 17px; padding: 12px; box-sizing: border-box; }
+    button { border: 0; border-radius: 6px; padding: 11px 16px; font-size: 15px; cursor: pointer; background: #1f4e79; color: white; }
+    button.secondary { background: #60758b; }
+    button.save { background: #2f7d32; }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    .row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+    label { display: block; font-size: 13px; color: #435064; margin-bottom: 5px; }
+    input, select { width: 100%; box-sizing: border-box; padding: 9px; border: 1px solid #c8d3df; border-radius: 5px; font-size: 15px; }
+    .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+    .status { margin-top: 10px; color: #435064; white-space: pre-wrap; }
+    .match { font-size: 12px; color: #5f6d7c; margin-top: 4px; }
+    .confirm { color: #9a4d00; font-weight: 700; }
+    .fileline { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; }
+    .fileline input { max-width: 520px; }
+    a { color: #1f4e79; font-weight: 600; }
+    @media (max-width: 800px) { .row { grid-template-columns: 1fr; } main { padding: 16px; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>引合書 音声入力フォーム</h1>
+  <section class="panel">
+    <label for="voiceText">音声または手入力</label>
+    <textarea id="voiceText">得意先 良栄社、受注日 今日、出荷希望日 明後日、倉庫011、値引き外掛け、値引き率3%、製品SP853A</textarea>
+    <div class="actions">
+      <button id="listenBtn">音声入力開始</button>
+      <button class="secondary" id="parseBtn">内容をフォームへ反映</button>
+    </div>
+    <div class="status" id="speechStatus"></div>
+  </section>
+
+  <section class="panel">
+    <label for="orderImage">注文書写真から読み取り</label>
+    <div class="fileline">
+      <input id="orderImage" type="file" accept="image/*,.pdf">
+      <button class="secondary" id="imageParseBtn">写真を読み取ってフォームへ反映</button>
+    </div>
+    <div class="status" id="imageStatus">Gemini API の接続状態を確認中...</div>
+  </section>
+
+  <section class="panel">
+    <div class="row">
+      <div><label>得意先名</label><input id="customer_name"><select id="customer_candidates"></select><div class="match" id="customer_match"></div></div>
+      <div><label>得意先コード</label><input id="customer_code"></div>
+      <div><label>納入先名</label><input id="delivery_name"><select id="delivery_candidates"></select><div class="match" id="delivery_match"></div></div>
+      <div><label>納入先コード</label><input id="delivery_code"></div>
+      <div><label>受注日</label><input id="order_date" type="date"></div>
+      <div><label>生産日</label><input id="production_date" type="date"><div class="match">未指定の場合は帳票に「在庫」と入ります</div></div>
+      <div><label>出荷希望日</label><input id="ship_date" type="date"></div>
+      <div><label>倉庫</label><select id="warehouse"><option>011</option><option>031</option></select></div>
+      <div><label>値引方法</label><select id="discount_method"><option>外掛</option><option>内掛</option></select></div>
+      <div><label>値引率(%)</label><input id="discount_rate" type="number" step="0.1"></div>
+      <div><label>製品名</label><input id="product_name"><select id="product_candidates"></select><div class="match" id="product_match"></div></div>
+      <div><label>商品コード</label><input id="product_code"></div>
+      <div><label>数量</label><input id="quantity" type="number" value="1"></div>
+    </div>
+    <div class="actions">
+      <button class="save" id="saveBtn">新規Excelとして保存</button>
+    </div>
+    <div class="status" id="saveStatus"></div>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let currentFields = {};
+
+function setStatus(id, text) { $(id).textContent = text; }
+
+async function loadStatus() {
+  try {
+    const res = await fetch("/api/status");
+    const data = await res.json();
+    if (data.gemini_configured) {
+      setStatus("imageStatus", `Gemini API 接続設定あり (${data.gemini_model})。注文書写真を読み取れます。`);
+    } else {
+      setStatus("imageStatus", "画像読み取りには GEMINI_API_KEY が必要です。");
+    }
+  } catch {
+    setStatus("imageStatus", "Gemini API の接続状態を確認できませんでした。");
+  }
+}
+
+loadStatus();
+
+function optionLabel(item, type) {
+  if (!item) return "";
+  const score = item.score ? ` / 一致度 ${item.score}` : "";
+  const place = item.address ? ` / ${item.address}` : "";
+  const price = item.price ? ` / ${item.price}` : "";
+  return `${item.name || ""} / ${item.code || ""}${place}${price}${score}`;
+}
+
+function fillSelect(selectId, candidates, selectedCode) {
+  const select = $(selectId);
+  select.innerHTML = "";
+  if (!candidates || candidates.length === 0) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "候補なし";
+    select.appendChild(opt);
+    return;
+  }
+  candidates.forEach((item, index) => {
+    const opt = document.createElement("option");
+    opt.value = String(index);
+    opt.textContent = optionLabel(item);
+    if (selectedCode && String(item.code) === String(selectedCode)) opt.selected = true;
+    select.appendChild(opt);
+  });
+}
+
+function applyCandidate(kind, index) {
+  const list = currentFields[`${kind}_andidates`] || currentFields[`${kind}_candidates`] || [];
+  const item = list[Number(index)];
+  if (!item) return;
+  if (kind === "customer") {
+    currentFields.customer = item;
+    $("customer_name").value = item.name || "";
+    $("customer_code").value = item.code || "";
+  } else if (kind === "delivery") {
+    currentFields.delivery = item;
+    $("delivery_name").value = item.name || "";
+    $("delivery_code").value = item.code || "";
+  } else if (kind === "product") {
+    currentFields.product = item;
+    $("product_name").value = item.name || "";
+    $("product_code").value = item.code || "";
+  }
+}
+
+function applyFields(data, statusId) {
+  currentFields = data.fields;
+  const f = currentFields;
+  $("customer_name").value = f.customer?.name || f.customer_query || "";
+  $("customer_code").value = f.customer?.code || "";
+  $("delivery_name").value = f.delivery?.name || f.delivery_query || "";
+  $("delivery_code").value = f.delivery?.code || "";
+  $("order_date").value = f.order_date || "";
+  $("production_date").value = f.production_date || "";
+  $("ship_date").value = f.ship_date || "";
+  $("warehouse").value = f.warehouse || "011";
+  $("discount_method").value = f.discount_method || "外掛";
+  $("discount_rate").value = f.discount_rate || "";
+  $("product_name").value = f.product?.name || f.product_query || "";
+  $("product_code").value = f.product?.code || "";
+  $("quantity").value = f.quantity || 1;
+
+  fillSelect("customer_candidates", f.customer_candidates, f.customer?.code);
+  fillSelect("delivery_candidates", f.delivery_candidates, f.delivery?.code);
+  fillSelect("product_candidates", f.product_candidates, f.product?.code);
+
+  $("customer_match").innerHTML = f.customer
+    ? `${f.customer_needs_confirmation ? '<span class="confirm">候補確認が必要です。</span> ' : ''}一致度 ${f.customer.score}`
+    : "候補なし";
+  $("delivery_match").innerHTML = f.delivery
+    ? `${f.delivery_needs_confirmation ? '<span class="confirm">候補確認が必要です。</span> ' : ''}一致度 ${f.delivery.score}`
+    : "候補なし";
+  $("product_match").innerHTML = f.product
+    ? `${f.product_needs_confirmation ? '<span class="confirm">候補確認が必要です。</span> ' : ''}一致度 ${f.product.score}`
+    : "候補なし";
+  const warnings = [];
+  if (f.customer_needs_confirmation) warnings.push("得意先");
+  if (f.delivery_needs_confirmation) warnings.push("納入先");
+  if (f.product_needs_confirmation) warnings.push("製品");
+  setStatus(statusId, `解析完了 (${data.parser})${warnings.length ? "\\n確認してください: " + warnings.join("、") : ""}`);
+}
+
+$("customer_candidates").onchange = (e) => applyCandidate("customer", e.target.value);
+$("delivery_candidates").onchange = (e) => applyCandidate("delivery", e.target.value);
+$("product_candidates").onchange = (e) => applyCandidate("product", e.target.value);
+
+function debounce(fn, wait) {
+  let timer;
+  return (...args) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn(...args), wait);
+  };
+}
+
+function addBusinessDaysIso(isoDate, days) {
+  if (!isoDate) return "";
+  const date = new Date(`${isoDate}T00:00:00`);
+  if (Number.isNaN(date.getTime())) return "";
+  let added = 0;
+  while (added < days) {
+    date.setDate(date.getDate() + 1);
+    const day = date.getDay();
+    if (day !== 0 && day !== 6) added += 1;
+  }
+  return date.toISOString().slice(0, 10);
+}
+
+async function suggest(kind, query) {
+  if (!query || query.trim().length < 1) return;
+  const res = await fetch(`/api/suggest?kind=${encodeURIComponent(kind)}&q=${encodeURIComponent(query)}`);
+  const data = await res.json();
+  if (!res.ok) return;
+  const candidatesKey = `${kind}_candidates`;
+  currentFields[candidatesKey] = data.candidates || [];
+  currentFields[`${kind}_needs_confirmation`] = data.needs_confirmation;
+
+  const selectId = `${kind}_candidates`;
+  fillSelect(selectId, data.candidates, data.candidates?.[0]?.code);
+  const first = data.candidates?.[0];
+  const labelId = `${kind}_match`;
+  if (!first) {
+    $(labelId).textContent = "候補なし";
+    return;
+  }
+  const confirmText = data.needs_confirmation ? "候補確認が必要です。 " : "";
+  $(labelId).innerHTML = `${confirmText}一致度 ${first.score}`;
+
+  if (Number(first.score) >= 1.0) {
+    currentFields[kind] = first;
+    if (kind === "customer") {
+      $("customer_name").value = first.name || query;
+      $("customer_code").value = first.code || "";
+    } else if (kind === "delivery") {
+      $("delivery_name").value = first.name || query;
+      $("delivery_code").value = first.code || "";
+    } else if (kind === "product") {
+      $("product_name").value = first.name || query;
+      $("product_code").value = first.code || "";
+    }
+  }
+}
+
+$("customer_name").addEventListener("input", debounce((e) => suggest("customer", e.target.value), 250));
+$("delivery_name").addEventListener("input", debounce((e) => suggest("delivery", e.target.value), 250));
+$("product_name").addEventListener("input", debounce((e) => suggest("product", e.target.value), 250));
+$("production_date").addEventListener("change", (e) => {
+  if (!$("ship_date").value) {
+    $("ship_date").value = addBusinessDaysIso(e.target.value, 2);
+  }
+});
+
+$("listenBtn").onclick = () => {
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SpeechRecognition) {
+    setStatus("speechStatus", "このブラウザはWeb Speech APIに未対応です。ChromeまたはEdgeで開いてください。");
+    return;
+  }
+  const rec = new SpeechRecognition();
+  rec.lang = "ja-JP";
+  rec.interimResults = true;
+  rec.continuous = false;
+  $("listenBtn").disabled = true;
+  setStatus("speechStatus", "聞き取り中...");
+  rec.onresult = (event) => {
+    let text = "";
+    for (let i = 0; i < event.results.length; i++) text += event.results[i][0].transcript;
+    $("voiceText").value = text;
+  };
+  rec.onerror = (event) => setStatus("speechStatus", "音声入力エラー: " + event.error);
+  rec.onend = () => {
+    $("listenBtn").disabled = false;
+    setStatus("speechStatus", "聞き取り完了。必要なら文章を修正してから反映してください。");
+  };
+  rec.start();
+};
+
+$("parseBtn").onclick = async () => {
+  setStatus("speechStatus", "解析中...");
+  const res = await fetch("/api/parse", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ text: $("voiceText").value })
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    setStatus("speechStatus", data.error || "解析に失敗しました。");
+    return;
+  }
+  applyFields(data, "speechStatus");
+};
+
+$("imageParseBtn").onclick = async () => {
+  const file = $("orderImage").files[0];
+  if (!file) {
+    setStatus("imageStatus", "注文書写真を選択してください。");
+    return;
+  }
+  setStatus("imageStatus", "画像を読み取り中...");
+  const form = new FormData();
+  form.append("image", file);
+  const res = await fetch("/api/parse-image", { method: "POST", body: form });
+  const data = await res.json();
+  if (!res.ok) {
+    setStatus("imageStatus", data.error || "画像読み取りに失敗しました。");
+    return;
+  }
+  applyFields(data, "imageStatus");
+};
+
+$("saveBtn").onclick = async () => {
+  const fields = {
+    ...currentFields,
+    customer: { ...(currentFields.customer || {}), name: $("customer_name").value, code: $("customer_code").value },
+    delivery: { ...(currentFields.delivery || {}), name: $("delivery_name").value, code: $("delivery_code").value },
+    product: { ...(currentFields.product || {}), name: $("product_name").value, code: $("product_code").value },
+    order_date: $("order_date").value,
+    production_date: $("production_date").value,
+    ship_date: $("ship_date").value,
+    warehouse: $("warehouse").value,
+    discount_method: $("discount_method").value,
+    discount_rate: $("discount_rate").value,
+    quantity: $("quantity").value
+  };
+  setStatus("saveStatus", "Excel保存中...");
+  const res = await fetch("/api/save", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ fields })
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    setStatus("saveStatus", data.error || "保存に失敗しました。");
+    return;
+  }
+  setStatus("saveStatus", "保存しました: " + data.path);
+  const a = document.createElement("a");
+  a.href = data.download_url;
+  a.textContent = "保存したExcelをダウンロード";
+  a.style.display = "block";
+  a.style.marginTop = "8px";
+  $("saveStatus").appendChild(a);
+};
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/")
+def index():
+    return HTML
+
+
+@app.after_request
+def add_no_cache_headers(response):
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), geolocation=(), payment=()"
+    response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+    if env_bool("ENABLE_HSTS", False):
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+
+
+@app.post("/api/parse")
+def api_parse():
+    payload = flask_request.get_json(force=True)
+    text = payload.get("text", "")
+    if not text:
+        return jsonify({"error": "音声テキストが空です。"}), 400
+
+    api_key = payload.get("api_key") or os.getenv("GEMINI_API_KEY", "")
+    parsed = parse_with_gemini(text, api_key) if api_key else None
+    parser = "Gemini API" if parsed else "local parser"
+    if not parsed:
+        parsed = local_parse(text)
+    fields = resolve_fields(parsed)
+    return jsonify({"parser": parser, "fields": fields})
+
+
+@app.get("/api/status")
+def api_status():
+    return jsonify(
+        {
+            "gemini_configured": bool(os.getenv("GEMINI_API_KEY", "")),
+            "gemini_model": os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+            "template_exists": SOURCE_BOOK.exists(),
+            "max_upload_mb": int(os.getenv("MAX_UPLOAD_MB", "12")),
+        }
+    )
+
+
+@app.get("/api/suggest")
+def api_suggest():
+    kind = flask_request.args.get("kind", "")
+    query = flask_request.args.get("q", "")
+    if kind == "customer":
+        candidates = ranked_matches(query, MASTER["customers"], ("name", "kana", "code"), limit=10)
+    elif kind == "delivery":
+        candidates = ranked_matches(query, MASTER["deliveries"], ("name", "kana", "code", "address"), limit=10)
+    elif kind == "product":
+        candidates = ranked_matches(query, MASTER["products"], ("name", "code"), limit=10)
+    else:
+        return jsonify({"error": "unknown kind"}), 400
+    return jsonify(
+        {
+            "kind": kind,
+            "query": query,
+            "candidates": candidates,
+            "needs_confirmation": needs_confirmation(candidates),
+        }
+    )
+
+
+@app.post("/api/parse-image")
+def api_parse_image():
+    api_key = os.getenv("GEMINI_API_KEY", "")
+    if not api_key:
+        return jsonify({"error": "画像読み取りには環境変数 GEMINI_API_KEY が必要です。設定してアプリを再起動してください。"}), 400
+    file = flask_request.files.get("image")
+    if not file:
+        return jsonify({"error": "画像ファイルがありません。"}), 400
+    suffix = Path(file.filename or "").suffix.lower()
+    mime_type = file.mimetype or mimetypes.guess_type(file.filename or "")[0] or ""
+    if suffix not in ALLOWED_UPLOAD_EXTENSIONS:
+        audit("upload_rejected_extension", suffix=suffix)
+        return jsonify({"error": "許可されていないファイル形式です。jpg/png/webp/pdf を使ってください。"}), 400
+    if not (mime_type.startswith(ALLOWED_UPLOAD_MIME_PREFIXES) or mime_type in ALLOWED_UPLOAD_MIME_TYPES):
+        audit("upload_rejected_mime", mime=mime_type)
+        return jsonify({"error": "許可されていないファイル形式です。"}), 400
+    image_bytes = file.read()
+    if not image_bytes:
+        return jsonify({"error": "画像ファイルが空です。"}), 400
+
+    audit("image_parse_requested", filename=Path(file.filename or "upload").name, size=len(image_bytes), mime=mime_type)
+    parsed = parse_image_with_gemini(image_bytes, file.filename or "order.jpg", api_key)
+    if not parsed:
+        return jsonify({"error": "Gemini APIで画像を読み取れませんでした。画像の明るさ、ピント、APIキーを確認してください。"}), 400
+    fields = resolve_fields(parsed)
+    return jsonify({"parser": "Gemini Vision", "fields": fields})
+
+
+@app.post("/api/save")
+def api_save():
+    payload = flask_request.get_json(force=True)
+    fields = payload.get("fields") or {}
+    path = save_excel(fields)
+    token = create_download_token(path)
+    audit("excel_saved", file=path.name)
+    return jsonify({"path": str(path), "download_url": f"/download/{token}"})
+
+
+@app.get("/download/<token>")
+def download(token: str):
+    token_data = DOWNLOAD_TOKENS.get(token)
+    if not token_data:
+        audit("download_missing_token")
+        return jsonify({"error": "file not found"}), 404
+    path, expires_at = token_data
+    if time.time() > expires_at or not path.exists() or path.parent != OUTPUT_DIR:
+        DOWNLOAD_TOKENS.pop(token, None)
+        audit("download_expired")
+        return jsonify({"error": "file expired"}), 404
+    audit("download", file=path.name)
+    return send_file(path, as_attachment=True)
+
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=8765, debug=False)

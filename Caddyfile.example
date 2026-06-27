@@ -1,0 +1,18 @@
+# Replace inquiry.example.com with your real domain.
+# Router port-forwarding should expose only TCP 443 to this PC.
+
+inquiry.example.com {
+    encode gzip
+
+    reverse_proxy 127.0.0.1:8765 {
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Forwarded-Host {host}
+        header_up X-Real-IP {remote_host}
+    }
+
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy no-referrer
+    }
+}

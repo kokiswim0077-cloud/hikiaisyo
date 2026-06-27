@@ -1,0 +1,16 @@
+.env
+*.local
+__pycache__/
+*.py[cod]
+logs/
+*.log
+cloudflared_quick_tunnel.log
+outputs/
+*.xlsx
+!template.example.txt
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+Thumbs.db

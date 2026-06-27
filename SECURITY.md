@@ -1,0 +1,41 @@
+# Security Notes
+
+## Do Not Commit
+
+- `.env`
+- Gemini API keys
+- `APP_PASSWORD`
+- Real customer/product Excel template files
+- Generated Excel output files
+- Logs containing operational metadata
+
+## Recommended Deployment
+
+Best option for multiple PCs:
+
+```text
+Users' browsers -> Cloudflare Access or VPN -> one internal app host -> 127.0.0.1:8765 Flask/Waitress
+```
+
+Do not install the Gemini key and real Excel template on every PC unless there is a strong reason.
+
+## Existing Controls
+
+- Optional Basic Auth through `APP_PASSWORD`.
+- `PUBLIC_MODE=true` refuses to run without `APP_PASSWORD`.
+- Optional HTTPS enforcement through `REQUIRE_HTTPS`.
+- Upload size limit through `MAX_UPLOAD_MB`.
+- Upload extension/MIME validation for images/PDFs.
+- Generated downloads use random tokens instead of raw filenames.
+- Generated Excel retention cleanup.
+- Browser cache disabled.
+- Audit log support.
+
+## Remaining Hardening Work
+
+- Add per-user login instead of shared Basic Auth if more than a few users will use it.
+- Add CSRF protection if cookie/session authentication is introduced.
+- Add IP allowlisting or Cloudflare Access policies.
+- Encrypt stored templates and outputs if the machine is shared.
+- Add a scheduled cleanup task for output/log retention.
+- Add monitored backups for the Excel template only.

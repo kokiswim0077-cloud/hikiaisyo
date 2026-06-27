@@ -1,0 +1,6 @@
+Place the real inquiry Excel template here as:
+
+template.xlsx
+
+Do not commit the real template if the workbook contains customer, delivery, product, pricing, or order data.
+For production, keep it in a private folder and set INQUIRY_TEMPLATE in .env.

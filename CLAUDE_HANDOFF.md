@@ -127,6 +127,29 @@ Key cells currently written:
 - 値引方法 -> `外掛` or `内掛`.
 - Similar customer/delivery/product matches should be shown to the user for confirmation, especially when names exist in multiple prefectures.
 
+## Kubota Order-Form Rule
+
+The user provided sample images of Kubota `注文書（出荷指示書）` forms.
+
+For this format:
+
+- If the image is a Kubota shipping instruction form and refers to `関東甲信クボタ`, force customer code `61110`.
+- If the destination office is `大網営業所` or the Kubota office code is `040`, force delivery code `61110005`.
+- Delivery name should resolve to `㈱関東甲信クボタ　大網営業所`.
+- Read product from `形式名` / model name such as `RM953X/K`.
+- `RM953X/K` resolves to product code `0343-0210`.
+- Read shipping date from the lower remarks area, e.g. `6/29(月)出荷`.
+- Read warehouse from the lower remarks area, e.g. `011倉庫`.
+- For this image format, order date should be today, not necessarily the document's printed order date.
+
+Validated sample result:
+
+- Customer: `61110`
+- Delivery: `61110005`
+- Product: `0343-0210`
+- Warehouse: `011`
+- Shipping date: `2026-06-29`
+
 ## Known Recent Fixes
 
 - Gemini API now reads `.env` using `utf-8-sig` because PowerShell wrote BOM.

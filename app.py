@@ -517,13 +517,19 @@ def parse_image_with_gemini(image_bytes: bytes, filename: str, api_key: str) -> 
 品名・型式・品番から製品候補を読み取ってください。得意先と納入先が同じとは限りません。
 
 キー:
-customer_query, delivery_query, order_date, production_date, ship_date, warehouse, discount_name, discount_method, discount_rate, product_query, quantity, order_no
+customer_query, customer_code, delivery_query, delivery_code, delivery_office_name, delivery_office_code, order_date, production_date, ship_date, warehouse, discount_name, discount_method, discount_rate, product_query, product_code, quantity, order_no
 
 warehouseは011または031。不明なら空文字。
 discount_methodは外掛または内掛。不明なら空文字。
 discount_nameは台数値引、不需要期値引、実演機対応値引などの値引名。不明なら空文字。
 discount_rateは3%なら3。
 quantityは数値。
+
+クボタの「注文書（出荷指示書）」形式の場合:
+- 右上に株式会社クボタ、得意先名に関東甲信クボタがある場合は、customer_queryは「関東甲信クボタ（千葉県）」として扱う。
+- 「納所名」「納所コード」「届先」欄を重視する。例: 納所名が「大網営業所」なら delivery_office_name は「大網営業所」。
+- 下部の備考欄に「011倉庫」「6/29(月)出荷」のような手書き/赤字がある場合、warehouseとship_dateはそこから読む。
+- 商品は「形式名」「型式名」「商品名」欄を重視する。例: RM953X/K。
 """.strip()
     body = {
         "contents": [
@@ -556,17 +562,76 @@ quantityは数値。
         return None
 
 
+def row_by_code(rows: list[dict[str, object]], code: object) -> dict[str, object] | None:
+    wanted = str(code or "").strip()
+    if not wanted:
+        return None
+    for row in rows:
+        if str(row.get("code", "")).strip() == wanted:
+            return {**row, "score": 1.0}
+    return None
+
+
+def kubota_order_overrides(parsed: dict[str, object]) -> dict[str, object]:
+    result = dict(parsed)
+    blob = " ".join(str(value or "") for value in result.values())
+    normalized_blob = normalize(blob)
+
+    is_kubota_shipping_order = (
+        "関東甲信クボタ" in blob
+        or "株式会社クボタ" in blob
+        or "クボタ" in blob and ("営業所" in blob or "納所" in blob or "注文書" in blob)
+    )
+    if not is_kubota_shipping_order:
+        return result
+
+    # Business rule from the user: Kubota order-form format uses customer 61110.
+    result["customer_code"] = "61110"
+    result["customer_query"] = "関東甲信クボタ（千葉県）"
+    result["customer_force_confirmed"] = True
+    result["order_date"] = today().strftime("%Y-%m-%d")
+
+    office_name = str(result.get("delivery_office_name") or result.get("delivery_query") or "")
+    office_code = str(result.get("delivery_office_code") or "").strip().zfill(3)
+    if "大網" in office_name or "大網" in blob or office_code == "040":
+        result["delivery_code"] = "61110005"
+        result["delivery_query"] = "関東甲信クボタ 大網営業所"
+        result["delivery_force_confirmed"] = True
+
+    product_query = str(result.get("product_query") or "")
+    if not product_query:
+        # Common Kubota form pattern: model names are alphanumeric with a slash.
+        m = re.search(r"\b[A-Z]{1,4}\d{2,4}[A-Z]?(?:/[A-Z0-9]+)?\b", blob.upper())
+        if m:
+            result["product_query"] = m.group(0)
+
+    if not result.get("warehouse"):
+        m = re.search(r"\b(011|031)\s*倉庫", blob)
+        if m:
+            result["warehouse"] = m.group(1)
+
+    return result
+
+
 def resolve_fields(parsed: dict[str, object]) -> dict[str, object]:
     parsed = sanitize_parsed(parsed)
+    parsed = kubota_order_overrides(parsed)
     parsed = resolve_default_dates(parsed)
-    customer_candidates = ranked_matches(
-        str(parsed.get("customer_query", "")),
-        MASTER["customers"],
-        ("name", "kana", "code"),
-    )
+    exact_customer = row_by_code(MASTER["customers"], parsed.get("customer_code"))
+    if exact_customer:
+        customer_candidates = [exact_customer]
+    else:
+        customer_candidates = ranked_matches(
+            str(parsed.get("customer_query", "")),
+            MASTER["customers"],
+            ("name", "kana", "code"),
+        )
     customer = customer_candidates[0] if customer_candidates else None
+    exact_delivery = row_by_code(MASTER["deliveries"], parsed.get("delivery_code"))
     delivery_query = str(parsed.get("delivery_query", ""))
-    if delivery_query:
+    if exact_delivery:
+        delivery_candidates = [exact_delivery]
+    elif delivery_query:
         delivery_candidates = ranked_matches(delivery_query, MASTER["deliveries"], ("name", "kana", "code", "address"))
     elif customer:
         delivery_candidates = [
@@ -577,17 +642,21 @@ def resolve_fields(parsed: dict[str, object]) -> dict[str, object]:
     else:
         delivery_candidates = []
     delivery = delivery_candidates[0] if delivery_candidates else None
-    product_candidates = ranked_matches(str(parsed.get("product_query", "")), MASTER["products"], ("name", "code"))
+    exact_product = row_by_code(MASTER["products"], parsed.get("product_code"))
+    if exact_product:
+        product_candidates = [exact_product]
+    else:
+        product_candidates = ranked_matches(str(parsed.get("product_query", "")), MASTER["products"], ("name", "code"))
     product = product_candidates[0] if product_candidates else None
 
     return {
         **parsed,
         "customer": customer,
         "customer_candidates": customer_candidates,
-        "customer_needs_confirmation": needs_confirmation(customer_candidates),
+        "customer_needs_confirmation": False if parsed.get("customer_force_confirmed") else needs_confirmation(customer_candidates),
         "delivery": delivery,
         "delivery_candidates": delivery_candidates,
-        "delivery_needs_confirmation": needs_confirmation(delivery_candidates),
+        "delivery_needs_confirmation": False if parsed.get("delivery_force_confirmed") else needs_confirmation(delivery_candidates),
         "product": product,
         "product_candidates": product_candidates,
         "product_needs_confirmation": needs_confirmation(product_candidates),

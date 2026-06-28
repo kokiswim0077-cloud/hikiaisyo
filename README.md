@@ -20,6 +20,8 @@ Japanese voice/photo input web app for generating inquiry Excel files from an ex
 - If production date is provided and shipping date is omitted, shipping date is two business days after production date. Saturdays and Sundays are skipped.
 - Warehouse is `011` or `031`.
 - Discount method is `外掛` or `内掛`.
+- Kubota `注文書（出荷指示書）` forms are handled with dedicated overrides:
+  customer `61110`, `大網営業所` delivery `61110005`, and model-name product matching such as `RM953X/K` -> `0343-0210`.
 
 ## Required Local Files
 

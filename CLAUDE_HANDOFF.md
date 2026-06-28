@@ -140,6 +140,8 @@ For this format:
 - `RM953X/K` resolves to product code `0343-0210`.
 - Read shipping date from the lower remarks area, e.g. `6/29(月)出荷`.
 - Read warehouse from the lower remarks area, e.g. `011倉庫`.
+- Warehouse is based on the shipping source text, not the customer name. `オーレック関物`, `関東物流`, `関物`, or `関東物` means `031`; `福岡倉庫` or OREC head-office/Fukuoka wording means `011`.
+- If OCR or an old note reads `033`, convert it to `031`; `033` should not be shown or written to Excel.
 - For this image format, order date should be today, not necessarily the document's printed order date.
 
 Validated sample result:
@@ -164,6 +166,7 @@ Validated on four real sample images on 2026-06-28.
    - Customer/delivery code `61376`.
    - Product `HR403` can resolve to `0365-0020`.
    - Handwritten note such as `24日出荷希望です` should drive shipping date.
+   - Do not force warehouse `031` just because the customer is 良栄社商会. Use the shipping source/出荷口 text.
 
 3. General order sheet / 木嶋商店:
    - Right-side seller/orderer `有限会社 木嶋商店` -> customer `61310`.

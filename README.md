@@ -19,6 +19,9 @@ Japanese voice/photo input web app for generating inquiry Excel files from an ex
 - If production date is omitted, write `在庫` to the production-date cell.
 - If production date is provided and shipping date is omitted, shipping date is two business days after production date. Saturdays and Sundays are skipped.
 - Warehouse is `011` or `031`.
+- Warehouse should be read from the shipping source/remarks, not fixed by customer:
+  `011` for OREC head office/Fukuoka warehouse, `031` for OREC Kanto logistics / `オーレック関物`.
+- If `033` is read from an old note or OCR result, the app must convert it to `031`.
 - Discount method is `外掛` or `内掛`.
 - Kubota `注文書（出荷指示書）` forms are handled with dedicated overrides:
   customer `61110`, `大網営業所` delivery `61110005`, and model-name product matching such as `RM953X/K` -> `0343-0210`.

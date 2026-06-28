@@ -361,6 +361,7 @@ def infer_product_query(text: str) -> str:
 def model_tokens_from_text(text: str) -> list[str]:
     normalized = unicodedata.normalize("NFKC", text or "").upper()
     tokens = re.findall(r"\b[A-Z]{1,5}\d{2,4}[A-Z]{0,3}(?:/[A-Z0-9]+)?\b", normalized)
+    tokens.extend(re.findall(r"\b[A-Z]{1,5}\d{2,4}(?:/[A-Z0-9]+)?\b", normalized))
     # Prefer more specific tokens first: RCHR800A before RCHR800, RM983FX before RM983.
     return sorted(dict.fromkeys(tokens), key=len, reverse=True)
 
@@ -405,10 +406,18 @@ def resolve_default_dates(parsed: dict[str, object]) -> dict[str, object]:
     return result
 
 
+def normalize_warehouse(value: object) -> str:
+    code = str(value or "").strip()
+    if re.fullmatch(r"0?\d{2,3}", code):
+        code = code.zfill(3)
+    if code == "033":
+        return "031"
+    return code if code in {"011", "031"} else ""
+
+
 def sanitize_parsed(parsed: dict[str, object]) -> dict[str, object]:
     result = dict(parsed)
-    if result.get("warehouse") not in {"011", "031", ""}:
-        result["warehouse"] = ""
+    result["warehouse"] = normalize_warehouse(result.get("warehouse"))
     if result.get("discount_method") not in {"外掛", "内掛", ""}:
         text = str(result.get("discount_method") or "")
         if re.search(r"外掛|外がけ|外掛け|外書き", text):
@@ -440,9 +449,9 @@ def local_parse(text: str) -> dict[str, object]:
     warehouse = ""
     m = re.search(r"倉庫\s*(0?\d{2,3})", compact)
     if m:
-        warehouse = m.group(1).zfill(3)
-    if warehouse not in {"011", "031"}:
-        warehouse = "011" if "011" in compact else ("031" if "031" in compact else "")
+        warehouse = normalize_warehouse(m.group(1))
+    if not warehouse:
+        warehouse = "011" if "011" in compact else ("031" if ("031" in compact or "033" in compact) else "")
 
     discount_method = ""
     if re.search(r"外掛|外がけ|外掛け|外書き", compact):
@@ -491,7 +500,7 @@ def parse_with_gemini(text: str, api_key: str) -> dict[str, object] | None:
 不明な項目は空文字にしてください。日付は今日={today().strftime('%Y-%m-%d')}を基準にYYYY-MM-DDへ変換してください。
 キー:
 customer_query, delivery_query, order_date, production_date, ship_date, warehouse, discount_name, discount_method, discount_rate, product_query, quantity
-discount_methodは外掛または内掛。音声誤認識の「内書き」は内掛として扱ってください。warehouseは011または031。discount_rateは3%なら3。
+discount_methodは外掛または内掛。音声誤認識の「内書き」は内掛として扱ってください。warehouseは011または031。033と読めた場合は031として扱ってください。discount_rateは3%なら3。
 
 テキスト:
 {text}
@@ -527,7 +536,7 @@ def parse_image_with_gemini(image_bytes: bytes, filename: str, api_key: str) -> 
 キー:
 document_type, issuer_query, visible_text, customer_query, customer_code, delivery_query, delivery_code, delivery_office_name, delivery_office_code, order_date, production_date, production_text, ship_date, ship_text, warehouse, discount_name, discount_method, discount_rate, product_query, product_code, quantity, order_no
 
-warehouseは011または031。不明なら空文字。
+warehouseは011または031。不明なら空文字。033と読めた場合は031として扱ってください。
 discount_methodは外掛または内掛。不明なら空文字。
 discount_nameは台数値引、不需要期値引、実演機対応値引などの値引名。不明なら空文字。
 discount_rateは3%なら3。
@@ -595,10 +604,25 @@ def row_by_code(rows: list[dict[str, object]], code: object) -> dict[str, object
     return None
 
 
+def apply_shipping_source_warehouse(parsed: dict[str, object]) -> dict[str, object]:
+    result = dict(parsed)
+    blob = " ".join(str(value or "") for value in result.values())
+
+    m = re.search(r"\b(011|031|033)\s*倉庫", blob)
+    if m:
+        result["warehouse"] = normalize_warehouse(m.group(1))
+
+    if any(term in blob for term in ["オーレック関物", "関東物流", "関物", "関東物"]):
+        result["warehouse"] = "031"
+    elif any(term in blob for term in ["福岡倉庫", "オーレック本社", "本社 福岡", "本社（福岡）", "本社(福岡)"]):
+        result["warehouse"] = "011"
+
+    return result
+
+
 def kubota_order_overrides(parsed: dict[str, object]) -> dict[str, object]:
     result = dict(parsed)
     blob = " ".join(str(value or "") for value in result.values())
-    normalized_blob = normalize(blob)
 
     is_kubota_shipping_order = (
         "関東甲信クボタ" in blob
@@ -631,17 +655,17 @@ def kubota_order_overrides(parsed: dict[str, object]) -> dict[str, object]:
         result["delivery_query"] = delivery_query
         result["delivery_force_confirmed"] = True
 
+    if office_code == "034" or "君津" in office_name or "君津" in blob:
+        result["delivery_code"] = "61110011"
+        result["delivery_query"] = "関東甲信クボタ 君津営業所"
+        result["delivery_force_confirmed"] = True
+
     product_query = str(result.get("product_query") or "")
     if not product_query:
         # Common Kubota form pattern: model names are alphanumeric with a slash.
         m = re.search(r"\b[A-Z]{1,4}\d{2,4}[A-Z]?(?:/[A-Z0-9]+)?\b", blob.upper())
         if m:
             result["product_query"] = m.group(0)
-
-    if not result.get("warehouse"):
-        m = re.search(r"\b(011|031)\s*倉庫", blob)
-        if m:
-            result["warehouse"] = m.group(1)
 
     return result
 
@@ -675,6 +699,7 @@ def resolve_fields(parsed: dict[str, object]) -> dict[str, object]:
     parsed = sanitize_parsed(parsed)
     parsed = kubota_order_overrides(parsed)
     parsed = known_form_overrides(parsed)
+    parsed = apply_shipping_source_warehouse(parsed)
     parsed = resolve_default_dates(parsed)
     exact_customer = row_by_code(MASTER["customers"], parsed.get("customer_code"))
     if exact_customer:
@@ -721,14 +746,20 @@ def resolve_fields(parsed: dict[str, object]) -> dict[str, object]:
         **parsed,
         "customer": customer,
         "customer_candidates": customer_candidates,
+        "customer_name": customer.get("name", "") if customer else str(parsed.get("customer_query", "") or ""),
+        "customer_code": customer.get("code", "") if customer else str(parsed.get("customer_code", "") or ""),
         "customer_needs_confirmation": False if parsed.get("customer_force_confirmed") else needs_confirmation(customer_candidates),
         "delivery": delivery,
         "delivery_candidates": delivery_candidates,
+        "delivery_name": delivery.get("name", "") if delivery else str(parsed.get("delivery_query", "") or ""),
+        "delivery_code": delivery.get("code", "") if delivery else str(parsed.get("delivery_code", "") or ""),
         "delivery_needs_confirmation": False if parsed.get("delivery_force_confirmed") else needs_confirmation(delivery_candidates),
         "product": product,
         "product_candidates": product_candidates,
+        "product_name": product.get("name", "") if product else str(parsed.get("product_query", "") or ""),
+        "product_code": product.get("code", "") if product else str(parsed.get("product_code", "") or ""),
         "product_needs_confirmation": needs_confirmation(product_candidates),
-        "warehouse": parsed.get("warehouse") or "011",
+        "warehouse": normalize_warehouse(parsed.get("warehouse")) or "011",
         "discount_method": parsed.get("discount_method") or "外掛",
         "discount_rate": parsed.get("discount_rate") or "0",
         "quantity": parsed.get("quantity") or 1,
@@ -752,7 +783,7 @@ def save_excel(fields: dict[str, object]) -> Path:
     ws["I4"] = fields.get("order_date") or today().strftime("%Y-%m-%d")
     ws["H5"] = fields.get("production_date") or fields.get("production_text") or "在庫"
     ws["I6"] = fields.get("ship_date") or fields.get("ship_text") or ""
-    ws["B17"] = fields.get("warehouse") or "011"
+    ws["B17"] = normalize_warehouse(fields.get("warehouse")) or "011"
     ws["L7"] = fields.get("discount_name") or "音声入力値引"
     ws["L8"] = fields.get("discount_method") or "外掛"
     ws["N8"] = float(fields.get("discount_rate") or 0)
@@ -828,7 +859,7 @@ HTML = """
   <section class="panel">
     <label for="orderImage">注文書写真から読み取り</label>
     <div class="fileline">
-      <input id="orderImage" type="file" accept="image/*,.pdf">
+      <input id="orderImage" type="file" accept=".jpg,.jpeg,.png,.webp,.pdf">
       <button class="secondary" id="imageParseBtn">写真を読み取ってフォームへ反映</button>
     </div>
     <div class="status" id="imageStatus">Gemini API の接続状態を確認中...</div>

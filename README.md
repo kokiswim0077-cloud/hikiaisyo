@@ -11,6 +11,8 @@ Japanese voice/photo input web app for generating inquiry Excel files from an ex
 - Suggests customer, delivery destination, and product candidates from the workbook master sheets.
 - Handles ambiguous names by showing candidates for user confirmation.
 - Generates a new Excel file from `引合書+値引`.
+- Saved Excel filenames use creation date, delivery name, and model name:
+  `260628_納入先_機種名_引合書.xlsx`.
 
 ## Current Business Rules
 

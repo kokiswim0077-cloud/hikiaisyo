@@ -820,10 +820,39 @@ def resolve_fields(parsed: dict[str, object]) -> dict[str, object]:
     }
 
 
+def safe_filename_part(value: object, fallback: str) -> str:
+    text = str(value or "").strip() or fallback
+    text = re.sub(r'[\\/:*?"<>|]+', "", text)
+    text = re.sub(r"\s+", "", text)
+    text = text.strip(" ._")
+    return text[:40] or fallback
+
+
+def output_excel_path(fields: dict[str, object]) -> Path:
+    delivery = fields.get("delivery") or {}
+    product = fields.get("product") or {}
+    delivery_name = safe_filename_part(
+        delivery.get("name") or fields.get("delivery_name") or fields.get("delivery_query"),
+        "納入先未指定",
+    )
+    product_name = safe_filename_part(
+        product.get("name") or fields.get("product_name") or fields.get("product_query"),
+        "機種未指定",
+    )
+    base_name = f"{datetime.now().strftime('%y%m%d')}_{delivery_name}_{product_name}_引合書"
+    path = OUTPUT_DIR / f"{base_name}.xlsx"
+    if not path.exists():
+        return path
+    for index in range(2, 1000):
+        candidate = OUTPUT_DIR / f"{base_name}_{index}.xlsx"
+        if not candidate.exists():
+            return candidate
+    return OUTPUT_DIR / f"{base_name}_{secrets.token_hex(4)}.xlsx"
+
+
 def save_excel(fields: dict[str, object]) -> Path:
     fields = resolve_default_dates(fields)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = OUTPUT_DIR / f"引合書_{stamp}.xlsx"
+    output_path = output_excel_path(fields)
     shutil.copy2(SOURCE_BOOK, output_path)
     wb = load_workbook(output_path)
     ws = wb["引合書+値引"]

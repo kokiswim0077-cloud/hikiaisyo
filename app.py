@@ -1150,21 +1150,50 @@ $("listenBtn").onclick = () => {
     setStatus("speechStatus", "このブラウザはWeb Speech APIに未対応です。ChromeまたはEdgeで開いてください。");
     return;
   }
+  const maxListenMs = 60 * 1000;
+  const silenceMs = 20 * 1000;
   const rec = new SpeechRecognition();
   rec.lang = "ja-JP";
   rec.interimResults = true;
-  rec.continuous = false;
+  rec.continuous = true;
   $("listenBtn").disabled = true;
-  setStatus("speechStatus", "聞き取り中...");
+  setStatus("speechStatus", "聞き取り中... 最大60秒、20秒無音で自動停止します。");
+  let stoppedByTimer = "";
+  let stoppedByError = false;
+  let maxTimer = null;
+  let silenceTimer = null;
+  const stopListening = (reason) => {
+    stoppedByTimer = reason;
+    try { rec.stop(); } catch (_) {}
+  };
+  const resetSilenceTimer = () => {
+    clearTimeout(silenceTimer);
+    silenceTimer = setTimeout(() => stopListening("20秒無音だったため停止しました。"), silenceMs);
+  };
+  maxTimer = setTimeout(() => stopListening("60秒に達したため停止しました。"), maxListenMs);
+  resetSilenceTimer();
   rec.onresult = (event) => {
+    resetSilenceTimer();
     let text = "";
     for (let i = 0; i < event.results.length; i++) text += event.results[i][0].transcript;
     $("voiceText").value = text;
   };
-  rec.onerror = (event) => setStatus("speechStatus", "音声入力エラー: " + event.error);
-  rec.onend = () => {
+  rec.onspeechstart = resetSilenceTimer;
+  rec.onsoundstart = resetSilenceTimer;
+  rec.onerror = (event) => {
+    stoppedByError = true;
+    clearTimeout(maxTimer);
+    clearTimeout(silenceTimer);
     $("listenBtn").disabled = false;
-    setStatus("speechStatus", "聞き取り完了。必要なら文章を修正してから反映してください。");
+    setStatus("speechStatus", "音声入力エラー: " + event.error);
+  };
+  rec.onend = () => {
+    clearTimeout(maxTimer);
+    clearTimeout(silenceTimer);
+    $("listenBtn").disabled = false;
+    if (stoppedByError) return;
+    const message = stoppedByTimer || "聞き取り完了。";
+    setStatus("speechStatus", `${message} 必要なら文章を修正してから反映してください。`);
   };
   rec.start();
 };

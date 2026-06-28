@@ -44,6 +44,9 @@ password: APP_PASSWORD you set
 - Caddy terminates HTTPS and renews certificates.
 - Upload size limit defaults to 12 MB.
 - Upload file type is restricted to jpg/jpeg/png/webp/pdf.
+- Uploaded files are checked by file signature, not only by extension.
+- Voice/text input length is limited by `MAX_TEXT_CHARS`.
+- Gemini API key is only read on the server side.
 - Rate limits are applied per client IP.
 - Download links use random one-time-style tokens instead of filenames.
 - Generated Excel files are deleted after `OUTPUT_RETENTION_MINUTES` (default 120).

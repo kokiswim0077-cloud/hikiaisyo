@@ -22,6 +22,8 @@ Japanese voice/photo input web app for generating inquiry Excel files from an ex
 - Warehouse should be read from the shipping source/remarks, not fixed by customer:
   `011` for OREC head office/Fukuoka warehouse, `031` for OREC Kanto logistics / `オーレック関物`.
 - If `033` is read from an old note or OCR result, the app must convert it to `031`.
+- Voice input also understands shipping-source words such as `オーレック関物`, `関東物流`, `福岡倉庫`, and `本社`.
+- Voice input accepts discount rates such as `3%`, `値引3`, `値引率3`, and `値引き率3パーセント`.
 - Discount method is `外掛` or `内掛`.
 - Kubota `注文書（出荷指示書）` forms are handled with dedicated overrides:
   customer `61110`, `大網営業所` delivery `61110005`, and model-name product matching such as `RM953X/K` -> `0343-0210`.
@@ -29,6 +31,8 @@ Japanese voice/photo input web app for generating inquiry Excel files from an ex
   `市原営業所` -> delivery `61110004`,
   `木嶋商店` -> customer/delivery `61310`,
   `エルタ` order cards -> customer/delivery `65137`,
+  `大竹産業` -> customer/delivery `61323`,
+  OREC internal addressees such as `オーレック`, `関東営業所`, or `谷尾` should not become delivery destinations,
   and month-only production/shipping notes are preserved as text in the Excel output.
 
 ## Required Local Files

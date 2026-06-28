@@ -183,12 +183,24 @@ Validated on four real sample images on 2026-06-28.
    - `RCHR800A` -> product `0372-0180`.
    - `出荷予定日 2026年10月以降` should be preserved as text in the shipping cell.
 
+5. General order sheet / 大竹産業 and OREC internal addressees:
+   - `大竹産業` -> customer/delivery `61323`.
+   - `宛先 オーレック`, `関東営業所`, or staff names such as `谷尾` are internal addressees and should not become customer/delivery.
+   - If a customer is known and the parsed delivery is internal OREC, use the customer as the delivery destination.
+   - `RCSP540` -> product `0374-0060`.
+
+6. Voice input improvements:
+   - Shipping-source words should infer warehouse: `オーレック関物`/`関東物流` -> `031`, `福岡倉庫`/`本社` -> `011`.
+   - Discount rates like `値引き率3パーセント` should parse as `3`.
+
 ## Known Recent Fixes
 
 - Gemini API now reads `.env` using `utf-8-sig` because PowerShell wrote BOM.
 - Default Gemini model changed to `gemini-2.5-flash`.
 - `template.xlsx` was copied into the app folder for portability, but it is ignored by Git.
 - UI status now calls `/api/status` instead of always saying Gemini API is required.
+- Gemini calls retry once to reduce transient image-reading failures.
+- API keys are read from server environment only. Do not accept Gemini keys from browser payloads.
 
 ## Multi-PC Deployment Recommendation
 

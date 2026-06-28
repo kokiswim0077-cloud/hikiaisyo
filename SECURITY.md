@@ -31,7 +31,10 @@ Do not install the Gemini key and real Excel template on every PC unless there i
 - `PUBLIC_MODE=true` refuses to run without `APP_PASSWORD`.
 - Optional HTTPS enforcement through `REQUIRE_HTTPS`.
 - Upload size limit through `MAX_UPLOAD_MB`.
+- Voice/text input length limit through `MAX_TEXT_CHARS`.
+- Gemini API keys are read from server environment only, not from browser/API payloads.
 - Upload extension/MIME validation for images/PDFs.
+- Upload file signature validation for jpg/png/webp/pdf.
 - Generated downloads use random tokens instead of raw filenames.
 - Generated Excel retention cleanup.
 - Browser cache disabled.

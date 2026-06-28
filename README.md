@@ -4,6 +4,7 @@ Japanese voice/photo input web app for generating inquiry Excel files from an ex
 
 ## What It Does
 
+- Provides an inquiry form at `/` and a quote request/estimate form at `/quote`.
 - Accepts Japanese voice or typed text such as:
   `得意先 良栄社、受注日 今日、出荷希望日 明後日、倉庫011、値引き外掛け、値引き率3%、製品SP853A`
 - Uses Gemini API when configured, with local parsing fallback for text.
@@ -13,6 +14,10 @@ Japanese voice/photo input web app for generating inquiry Excel files from an ex
 - Generates a new Excel file from `引合書+値引`.
 - Saved Excel filenames use creation date, delivery name, and model name:
   `260628_納入先_機種名_引合書.xlsx`.
+- Quote estimate filenames use:
+  `260628_得意先_機種名_見積書.xlsx`.
+- Quote request copy filenames use:
+  `260628_得意先_機種名_見積依頼.xlsx`.
 
 ## Current Business Rules
 
@@ -36,6 +41,11 @@ Japanese voice/photo input web app for generating inquiry Excel files from an ex
   `大竹産業` -> customer/delivery `61323`,
   OREC internal addressees such as `オーレック`, `関東営業所`, or `谷尾` should not become delivery destinations,
   and month-only production/shipping notes are preserved as text in the Excel output.
+- Quote form excludes response deadline, freight, payment terms, and FAX status.
+- Quote learned rules include:
+  `伊藤産業機械` -> customer `61105`,
+  `大竹産業` -> customer `61323`,
+  and models such as `AM64B`, `RM832A`, `SP853A`, `RCSP540`, `AM65B` resolve through the product master.
 
 ## Required Local Files
 

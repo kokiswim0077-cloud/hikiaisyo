@@ -17,7 +17,8 @@ from pathlib import Path
 from urllib import request
 
 from flask import Flask, Response, jsonify, request as flask_request, send_file
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -619,7 +620,7 @@ issuer_queryは帳票右上や発行元に書かれた会社名。visible_text�
         ],
         "generationConfig": {"responseMimeType": "application/json"},
     }
-    return request_gemini_json(endpoint, body, api_key, timeout=45)
+    return request_gemini_json(endpoint, body, api_key, timeout=25)
 
 
 def row_by_code(rows: list[dict[str, object]], code: object) -> dict[str, object] | None:
@@ -850,6 +851,417 @@ def output_excel_path(fields: dict[str, object]) -> Path:
     return OUTPUT_DIR / f"{base_name}_{secrets.token_hex(4)}.xlsx"
 
 
+def numeric_value(value: object) -> int:
+    text = str(value or "").replace(",", "").strip()
+    if not text:
+        return 0
+    try:
+        return int(float(text))
+    except ValueError:
+        return 0
+
+
+def coerce_parsed_dict(value: object) -> dict[str, object]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                return item
+    return {}
+
+
+def quote_output_path(fields: dict[str, object], suffix: str) -> Path:
+    customer = fields.get("customer") or {}
+    product = fields.get("product") or {}
+    customer_name = safe_filename_part(
+        customer.get("name") or fields.get("customer_name") or fields.get("customer_query"),
+        "得意先未指定",
+    )
+    product_name = safe_filename_part(
+        product.get("name") or fields.get("product_name") or fields.get("product_query"),
+        "機種未指定",
+    )
+    base_name = f"{datetime.now().strftime('%y%m%d')}_{customer_name}_{product_name}_{suffix}"
+    path = OUTPUT_DIR / f"{base_name}.xlsx"
+    if not path.exists():
+        return path
+    for index in range(2, 1000):
+        candidate = OUTPUT_DIR / f"{base_name}_{index}.xlsx"
+        if not candidate.exists():
+            return candidate
+    return OUTPUT_DIR / f"{base_name}_{secrets.token_hex(4)}.xlsx"
+
+
+def quote_local_parse(text: str) -> dict[str, object]:
+    compact = unicodedata.normalize("NFKC", text)
+    stops = ["担当", "商品", "製品", "品番", "型式", "機種", "数量", "台数", "在庫", "生産", "出荷", "備考", "値引", "小売", "仕切"]
+    customer_query = clean_query_fragment(extract_after_keyword(compact, ["得意先", "お客様", "客先", "宛先"], stops))
+    product_query = infer_product_query(compact)
+
+    quantity = 1
+    m = re.search(r"(?:数量|台数)?\s*(\d+)\s*(?:台|個|本|枚)", compact)
+    if m:
+        quantity = int(m.group(1))
+
+    discount_rate = ""
+    m = re.search(r"(\d+(?:\.\d+)?)\s*%", compact)
+    if not m:
+        m = re.search(r"値引(?:き)?(?:率)?\s*(\d+(?:\.\d+)?)\s*(?:パーセント|パー)?", compact)
+    if m:
+        discount_rate = m.group(1)
+
+    stock_status = ""
+    for status in ["在庫限り", "生産待ち", "在庫有り", "有り", "あり", "無し", "なし"]:
+        if status in compact:
+            stock_status = "有り" if status == "あり" else ("無し" if status == "なし" else status)
+            break
+
+    return {
+        "customer_query": customer_query,
+        "staff_name": clean_query_fragment(extract_after_keyword(compact, ["担当", "担当者"], stops)),
+        "quote_date": parse_date(compact, ["見積日", "作成日", "依頼日"]),
+        "product_query": product_query,
+        "quantity": quantity,
+        "retail_price": numeric_value(extract_after_keyword(compact, ["小売単価", "小売"], stops)),
+        "wholesale_price": numeric_value(extract_after_keyword(compact, ["仕切単価", "仕切"], stops)),
+        "discounted_price": numeric_value(extract_after_keyword(compact, ["値引後単価", "値引後"], stops)),
+        "discount_name": clean_query_fragment(extract_after_keyword(compact, ["値引名"], stops)),
+        "discount_rate": discount_rate,
+        "stock_status": stock_status,
+        "production_date": parse_date(compact, ["生産日", "生産"]),
+        "ship_date": parse_date(compact, ["出荷予定日", "出荷日", "出荷"]),
+        "note": clean_query_fragment(extract_after_keyword(compact, ["備考", "メモ"], [])),
+    }
+
+
+def clean_quote_free_text(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    boilerplate_patterns = [
+        r"(?:尚[、,]?\s*)?生産予定日は諸事情により変動する場合[がも]ございますのでご了承(?:ください|願います)。?",
+        r"見積り?時点での商品確保はできかねます。?",
+        r"商品確保はできかねます。?",
+        r"お手数ですが在庫の有無は都度[ご]?確認いただくようお願い申し上げます。?",
+        r"出荷日は生産日の翌々日対応です。?",
+        r"\d{1,2}/\d{1,2}(?:\([月火水木金土日]\))?\s*早めに返信(?:願います|お願いします)?。?",
+        r"早めに返信(?:願います|お願いします)?。?",
+        r"毎度格別のお引き立てを賜りお礼申し上げます。?",
+        r"下記の通りお見積り申し上げます。?",
+    ]
+    for pattern in boilerplate_patterns:
+        text = re.sub(pattern, "", text)
+    text = re.sub(r"[\s　]*\n[\s　]*", "\n", text)
+    text = re.sub(r"[ 　]{2,}", " ", text)
+    return text.strip(" \n、。,※")
+
+
+def clean_quote_auxiliary_fields(result: dict[str, object]) -> dict[str, object]:
+    cleaned = dict(result)
+    for key in ["note", "production_text", "ship_text"]:
+        cleaned[key] = clean_quote_free_text(cleaned.get(key))
+    if "諸事情" in str(cleaned.get("production_text") or ""):
+        cleaned["production_text"] = ""
+    if "翌々日対応" in str(cleaned.get("ship_text") or ""):
+        cleaned["ship_text"] = ""
+    stock_status = str(cleaned.get("stock_status") or "")
+    if "在庫限り" in stock_status:
+        cleaned["stock_status"] = "在庫限り"
+    elif "生産待ち" in stock_status:
+        cleaned["stock_status"] = "生産待ち"
+    elif "有り" in stock_status or "あり" in stock_status:
+        cleaned["stock_status"] = "有り"
+    elif "無し" in stock_status or "なし" in stock_status:
+        cleaned["stock_status"] = "無し"
+    elif "商品確保" in stock_status:
+        cleaned["stock_status"] = ""
+    if "在庫限り" in str(cleaned.get("note") or "") and cleaned.get("stock_status") in {"", "有り"}:
+        cleaned["stock_status"] = "在庫限り"
+        cleaned["note"] = clean_quote_free_text(str(cleaned.get("note") or "").replace("在庫限り", ""))
+    if re.fullmatch(r"\d+\s*台", str(cleaned.get("note") or "").strip()):
+        cleaned["note"] = ""
+    return cleaned
+
+
+def parse_quote_with_gemini(text: str, api_key: str) -> dict[str, object] | None:
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    prompt = f"""
+日本語の見積依頼テキストから、見積フォーム入力用の項目をJSONだけで抽出してください。
+不明な項目は空文字にしてください。日付は今日={today().strftime('%Y-%m-%d')}を基準にYYYY-MM-DDへ変換してください。
+回答期限、運賃、支払条件、FAX済みは抽出しないでください。
+
+キー:
+customer_query, customer_code, staff_name, quote_date, product_query, product_code, quantity, retail_price, wholesale_price, discounted_price, discount_name, discount_rate, stock_status, production_date, production_text, ship_date, ship_text, note
+
+ルール:
+- 赤字や追記がある場合は note、生産日、出荷予定日を優先してください。
+- 「8月以降で回答していい？」のような内容は note に入れてください。
+- 数量/台数がなければ1。
+- 金額はカンマなしの数値。
+
+テキスト:
+{text}
+""".strip()
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"responseMimeType": "application/json"},
+    }
+    return request_gemini_json(endpoint, body, api_key, timeout=20)
+
+
+def parse_quote_image_with_gemini(image_bytes: bytes, filename: str, api_key: str) -> dict[str, object] | None:
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    mime_type = mimetypes.guess_type(filename)[0] or "image/jpeg"
+    prompt = f"""
+見積書または見積依頼書の画像を読み取り、見積フォーム入力用の項目をJSONだけで抽出してください。
+読み取れない項目は空文字にしてください。日付は今日={today().strftime('%Y-%m-%d')}を基準にYYYY-MM-DDへ正規化してください。
+回答期限、運賃、支払条件、FAX済みは抽出しないでください。
+
+キー:
+document_type, visible_text, customer_query, customer_code, staff_name, quote_date, product_query, product_code, quantity, retail_price, wholesale_price, discounted_price, discount_name, discount_rate, stock_status, production_date, production_text, ship_date, ship_text, note
+
+読み取りルール:
+- 「見積依頼書」は依頼元の会社名、型式/品名、数量、納期、連絡事項を読む。
+- 「見積書」は得意先名、商品コード、商品名、単価、在庫、備考の生産日/出荷日を読む。
+- 伊藤産業機械は customer_code 61105、大竹産業は customer_code 61323。
+- 赤字/紫字/手書き追記は重要。例: 「表は7/23(木)に記入しました」「8月以降で回答していい？」。
+- 「生産日」「出荷日」「次回生産」「出荷予定」は production_date/ship_date または production_text/ship_text に入れる。
+- 月だけの場合は production_text/ship_text に「8月」「2026年8月以降」のように入れる。
+- 数量/台数がなければ1。
+- 金額はカンマなしの数値。
+""".strip()
+    body = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inlineData": {
+                            "mimeType": mime_type,
+                            "data": base64.b64encode(image_bytes).decode("ascii"),
+                        }
+                    },
+                ]
+            }
+        ],
+        "generationConfig": {"responseMimeType": "application/json"},
+    }
+    return request_gemini_json(endpoint, body, api_key, timeout=25)
+
+
+def resolve_quote_fields(parsed: dict[str, object]) -> dict[str, object]:
+    result = coerce_parsed_dict(parsed)
+    blob = " ".join(str(value or "") for value in result.values())
+    if "大竹産業" in blob and not result.get("customer_code"):
+        result["customer_code"] = "61323"
+        result["customer_query"] = "大竹産業"
+    if "伊藤産業機械" in blob and not result.get("customer_code"):
+        result["customer_code"] = "61105"
+        result["customer_query"] = "伊藤産業機械"
+    if not result.get("customer_code") and any(term in blob for term in ["伊藤", "AM65B"]):
+        result["customer_code"] = "61105"
+        result["customer_query"] = "伊藤産業機械"
+    if not result.get("stock_status"):
+        for status in ["在庫限り", "生産待ち", "在庫有り", "有り", "あり", "無し", "なし"]:
+            if status in blob:
+                result["stock_status"] = "有り" if status == "あり" else ("無し" if status == "なし" else status)
+                break
+    if not result.get("note"):
+        note_parts = []
+        for pattern in [r"8月以降[^、。\n]*", r"表は[^、。\n]*記入[^、。\n]*"]:
+            m = re.search(pattern, blob)
+            if m:
+                note_parts.append(m.group(0))
+        if note_parts:
+            result["note"] = " / ".join(note_parts)
+    result = clean_quote_auxiliary_fields(result)
+    if not result.get("quote_date"):
+        result["quote_date"] = today().strftime("%Y-%m-%d")
+    try:
+        result["quantity"] = int(result.get("quantity") or 1)
+    except (TypeError, ValueError):
+        result["quantity"] = 1
+
+    exact_customer = row_by_code(MASTER["customers"], result.get("customer_code"))
+    if exact_customer:
+        customer_candidates = [exact_customer]
+    else:
+        customer_candidates = ranked_matches(str(result.get("customer_query", "")), MASTER["customers"], ("name", "kana", "code"))
+    customer = customer_candidates[0] if customer_candidates else None
+
+    exact_product = row_by_code(MASTER["products"], result.get("product_code"))
+    if exact_product:
+        product_candidates = [exact_product]
+    else:
+        product_search_text = " ".join(str(result.get(key, "") or "") for key in ["product_code", "product_query", "visible_text"])
+        token_candidates = []
+        for token in model_tokens_from_text(product_search_text):
+            token_candidates = ranked_matches(token, MASTER["products"], ("name", "code"))
+            if token_candidates and float(token_candidates[0].get("score", 0)) >= 0.9:
+                break
+        product_candidates = token_candidates or ranked_matches(str(result.get("product_query", "")), MASTER["products"], ("name", "code"))
+    product = product_candidates[0] if product_candidates else None
+
+    retail_price = numeric_value(result.get("retail_price"))
+    if not retail_price and product:
+        retail_price = numeric_value(product.get("price"))
+    wholesale_price = numeric_value(result.get("wholesale_price"))
+    if not wholesale_price and retail_price and customer:
+        rate = customer.get("rate")
+        try:
+            wholesale_price = int(round(retail_price * float(rate)))
+        except (TypeError, ValueError):
+            wholesale_price = 0
+    discounted_price = numeric_value(result.get("discounted_price"))
+    discount_rate = str(result.get("discount_rate") or "")
+    if not discounted_price and wholesale_price and discount_rate:
+        try:
+            discounted_price = int(round(wholesale_price * (1 - float(discount_rate) / 100)))
+        except ValueError:
+            discounted_price = 0
+
+    return {
+        **result,
+        "customer": customer,
+        "customer_candidates": customer_candidates,
+        "customer_name": customer.get("name", "") if customer else str(result.get("customer_query", "") or ""),
+        "customer_code": customer.get("code", "") if customer else str(result.get("customer_code", "") or ""),
+        "customer_needs_confirmation": needs_confirmation(customer_candidates),
+        "product": product,
+        "product_candidates": product_candidates,
+        "product_name": product.get("name", "") if product else str(result.get("product_query", "") or ""),
+        "product_code": product.get("code", "") if product else str(result.get("product_code", "") or ""),
+        "product_needs_confirmation": needs_confirmation(product_candidates),
+        "retail_price": retail_price,
+        "wholesale_price": wholesale_price,
+        "discounted_price": discounted_price,
+        "discount_rate": discount_rate,
+        "quantity": result.get("quantity") or 1,
+        "stock_status": result.get("stock_status") or "",
+        "production_date": result.get("production_date") or "",
+        "production_text": result.get("production_text") or "",
+        "ship_date": result.get("ship_date") or "",
+        "ship_text": result.get("ship_text") or "",
+        "note": result.get("note") or "",
+    }
+
+
+def style_quote_sheet(ws) -> None:
+    thin = Side(style="thin", color="000000")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+            cell.font = Font(name="Yu Gothic", size=10)
+    for row in ws.iter_rows(min_row=11, max_row=13, min_col=1, max_col=8):
+        for cell in row:
+            cell.border = border
+    for cell in ws[11]:
+        cell.fill = PatternFill("solid", fgColor="F2F2F2")
+        cell.font = Font(name="Yu Gothic", size=10, bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    widths = {"A": 14, "B": 20, "C": 12, "D": 14, "E": 14, "F": 12, "G": 13, "H": 24}
+    for col, width in widths.items():
+        ws.column_dimensions[col].width = width
+
+
+def save_quote_estimate_excel(fields: dict[str, object]) -> Path:
+    fields = resolve_quote_fields(fields)
+    output_path = quote_output_path(fields, "見積書")
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "見積書"
+    customer = fields.get("customer") or {}
+    product = fields.get("product") or {}
+
+    ws.merge_cells("A1:H1")
+    ws["A1"] = "見　積　書"
+    ws["A1"].font = Font(name="Yu Gothic", size=18, bold=True)
+    ws["A1"].alignment = Alignment(horizontal="center")
+    ws["A3"] = customer.get("code", "")
+    ws["B4"] = fields.get("customer_name") or customer.get("name", "")
+    ws["D4"] = "御中"
+    ws["G2"] = "作成日"
+    ws["H2"] = fields.get("quote_date") or today().strftime("%Y-%m-%d")
+    ws["F4"] = "㈱ オーレック関東営業G"
+    ws["F5"] = "TEL: 0480-50-9020"
+    ws["F6"] = "FAX: 0480-87-3009"
+    ws["B7"] = "毎度格別のお引き立てを賜りお礼申し上げます。"
+    ws["B8"] = "下記の通りお見積り申し上げます。"
+
+    headers = ["商品コード", "商品名", "小売単価", "仕切単価", "値引後単価", "台数", "在庫", "備考"]
+    for col, header in enumerate(headers, 1):
+        ws.cell(11, col).value = header
+    ws["A12"] = fields.get("product_code") or product.get("code", "")
+    ws["B12"] = fields.get("product_name") or product.get("name", "")
+    ws["C12"] = numeric_value(fields.get("retail_price"))
+    ws["D12"] = numeric_value(fields.get("wholesale_price"))
+    ws["E12"] = numeric_value(fields.get("discounted_price"))
+    ws["F12"] = int(fields.get("quantity") or 1)
+    ws["G12"] = fields.get("stock_status", "")
+    note_parts = []
+    if fields.get("production_date") or fields.get("production_text"):
+        note_parts.append(f"生産日 {fields.get('production_date') or fields.get('production_text')}")
+    if fields.get("ship_date") or fields.get("ship_text"):
+        note_parts.append(f"出荷日 {fields.get('ship_date') or fields.get('ship_text')}")
+    if fields.get("discount_name") or fields.get("discount_rate"):
+        note_parts.append(f"{fields.get('discount_name') or '値引'} {fields.get('discount_rate')}%".strip())
+    if fields.get("note"):
+        note_parts.append(str(fields.get("note")))
+    ws["H12"] = "\n".join(part for part in note_parts if part)
+
+    for cell in ["C12", "D12", "E12"]:
+        ws[cell].number_format = "#,##0"
+    ws["B16"] = "尚、生産予定日は諸事情により変動する場合がございますのでご了承願います。"
+    ws["B18"] = "見積り時点での商品確保はできかねます。"
+    style_quote_sheet(ws)
+    wb.save(output_path)
+    return output_path
+
+
+def save_quote_request_excel(fields: dict[str, object]) -> Path:
+    fields = resolve_quote_fields(fields)
+    output_path = quote_output_path(fields, "見積依頼")
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "見積依頼"
+    customer = fields.get("customer") or {}
+    product = fields.get("product") or {}
+
+    ws.merge_cells("A1:H1")
+    ws["A1"] = "見 積 依 頼 控 え"
+    ws["A1"].font = Font(name="Yu Gothic", size=18, bold=True)
+    ws["A1"].alignment = Alignment(horizontal="center")
+    ws["A3"] = "得意先"
+    ws["B3"] = fields.get("customer_name") or customer.get("name", "")
+    ws["F3"] = "依頼日"
+    ws["G3"] = fields.get("quote_date") or today().strftime("%Y-%m-%d")
+    ws["A4"] = "担当者"
+    ws["B4"] = fields.get("staff_name", "")
+
+    headers = ["商品コード", "商品名", "小売単価", "仕切単価", "値引後単価", "数量", "在庫", "備考"]
+    for col, header in enumerate(headers, 1):
+        ws.cell(7, col).value = header
+    ws["A8"] = fields.get("product_code") or product.get("code", "")
+    ws["B8"] = fields.get("product_name") or product.get("name", "")
+    ws["C8"] = numeric_value(fields.get("retail_price"))
+    ws["D8"] = numeric_value(fields.get("wholesale_price"))
+    ws["E8"] = numeric_value(fields.get("discounted_price"))
+    ws["F8"] = int(fields.get("quantity") or 1)
+    ws["G8"] = fields.get("stock_status", "")
+    ws["H8"] = fields.get("note", "")
+    ws["A11"] = "生産日"
+    ws["B11"] = fields.get("production_date") or fields.get("production_text") or ""
+    ws["A12"] = "出荷予定日"
+    ws["B12"] = fields.get("ship_date") or fields.get("ship_text") or ""
+    style_quote_sheet(ws)
+    wb.save(output_path)
+    return output_path
+
+
 def save_excel(fields: dict[str, object]) -> Path:
     fields = resolve_default_dates(fields)
     output_path = output_excel_path(fields)
@@ -929,6 +1341,7 @@ HTML = """
 <body>
 <main>
   <h1>引合書 音声入力フォーム</h1>
+  <p><a href="/quote">見積り依頼フォームへ</a></p>
   <section class="panel">
     <label for="voiceText">音声または手入力</label>
     <textarea id="voiceText">得意先 良栄社、受注日 今日、出荷希望日 明後日、倉庫011、値引き外掛け、値引き率3%、製品SP853A</textarea>
@@ -1270,9 +1683,331 @@ $("saveBtn").onclick = async () => {
 """
 
 
+QUOTE_HTML = """
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>見積り依頼フォーム</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0; background: #f5f7fb; color: #172033; }
+    main { max-width: 1100px; margin: 0 auto; padding: 28px; }
+    h1 { font-size: 26px; margin: 0 0 18px; }
+    .panel { background: white; border: 1px solid #d9e2ef; border-radius: 8px; padding: 18px; margin-bottom: 16px; }
+    textarea { width: 100%; min-height: 96px; font-size: 17px; padding: 12px; box-sizing: border-box; }
+    button { border: 0; border-radius: 6px; padding: 11px 16px; font-size: 15px; cursor: pointer; background: #1f4e79; color: white; }
+    button.secondary { background: #60758b; }
+    button.save { background: #2f7d32; }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    .row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+    label { display: block; font-size: 13px; color: #435064; margin-bottom: 5px; }
+    input, select { width: 100%; box-sizing: border-box; padding: 9px; border: 1px solid #c8d3df; border-radius: 5px; font-size: 15px; }
+    .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+    .status { margin-top: 10px; color: #435064; white-space: pre-wrap; }
+    .match { font-size: 12px; color: #5f6d7c; margin-top: 4px; }
+    .confirm { color: #9a4d00; font-weight: 700; }
+    .fileline { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; }
+    a { color: #1f4e79; font-weight: 600; }
+    @media (max-width: 800px) { .row { grid-template-columns: 1fr; } main { padding: 16px; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>見積り依頼フォーム</h1>
+  <p><a href="/">引合書フォームへ戻る</a></p>
+
+  <section class="panel">
+    <label for="quoteText">音声または手入力</label>
+    <textarea id="quoteText">得意先 大竹産業、担当 矢村、製品 RCSP540、数量1台、生産待ち、出荷予定 7月13日</textarea>
+    <div class="actions">
+      <button id="quoteListenBtn">音声入力開始</button>
+      <button class="secondary" id="quoteParseBtn">内容をフォームへ反映</button>
+    </div>
+    <div class="status" id="quoteSpeechStatus"></div>
+  </section>
+
+  <section class="panel">
+    <label for="quoteImage">見積依頼写真から読み取り</label>
+    <div class="fileline">
+      <input id="quoteImage" type="file" accept=".jpg,.jpeg,.png,.webp,.pdf">
+      <button class="secondary" id="quoteImageParseBtn">写真を読み取ってフォームへ反映</button>
+    </div>
+    <div class="status" id="quoteImageStatus">Gemini API の接続状態を確認中...</div>
+  </section>
+
+  <section class="panel">
+    <div class="row">
+      <div><label>得意先名</label><input id="quote_customer_name"><select id="quote_customer_candidates"></select><div class="match" id="quote_customer_match"></div></div>
+      <div><label>得意先コード</label><input id="quote_customer_code"></div>
+      <div><label>担当者</label><input id="quote_staff_name"></div>
+      <div><label>依頼日/作成日</label><input id="quote_date" type="date"></div>
+      <div><label>商品名/機種名</label><input id="quote_product_name"><select id="quote_product_candidates"></select><div class="match" id="quote_product_match"></div></div>
+      <div><label>商品コード</label><input id="quote_product_code"></div>
+      <div><label>数量/台数</label><input id="quote_quantity" type="number" value="1"></div>
+      <div><label>在庫状態</label><input id="quote_stock_status"></div>
+      <div><label>小売単価</label><input id="quote_retail_price" type="number"></div>
+      <div><label>仕切単価</label><input id="quote_wholesale_price" type="number"></div>
+      <div><label>値引後単価</label><input id="quote_discounted_price" type="number"></div>
+      <div><label>値引名</label><input id="quote_discount_name"></div>
+      <div><label>値引率(%)</label><input id="quote_discount_rate" type="number" step="0.1"></div>
+      <div><label>生産日</label><input id="quote_production_date" type="date"></div>
+      <div><label>出荷予定日</label><input id="quote_ship_date" type="date"></div>
+      <div><label>備考</label><input id="quote_note"></div>
+    </div>
+    <div class="actions">
+      <button class="save" id="quoteEstimateSaveBtn">見積書Excelとして保存</button>
+      <button class="save" id="quoteRequestSaveBtn">見積依頼控えExcelとして保存</button>
+    </div>
+    <div class="status" id="quoteSaveStatus"></div>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let quoteFields = {};
+
+function setStatus(id, message) { $(id).textContent = message || ""; }
+
+async function statusCheck() {
+  try {
+    const res = await fetch("/api/status");
+    const data = await res.json();
+    setStatus("quoteImageStatus", data.gemini_configured ? `Gemini API 接続設定あり (${data.gemini_model})。` : "画像読み取りには GEMINI_API_KEY が必要です。");
+  } catch (_) {
+    setStatus("quoteImageStatus", "Gemini API の接続状態を確認できませんでした。");
+  }
+}
+statusCheck();
+
+function fillSelect(selectId, candidates, selectedCode) {
+  const select = $(selectId);
+  select.innerHTML = "";
+  (candidates || []).forEach((item, index) => {
+    const opt = document.createElement("option");
+    opt.value = index;
+    opt.selected = selectedCode && String(item.code) === String(selectedCode);
+    opt.textContent = `${item.name || ""} / ${item.code || ""} / 一致度 ${item.score ?? ""}`;
+    select.appendChild(opt);
+  });
+}
+
+function applyCandidate(kind, index) {
+  const list = quoteFields[`${kind}_candidates`] || [];
+  const item = list[Number(index)];
+  if (!item) return;
+  if (kind === "customer") {
+    quoteFields.customer = item;
+    $("quote_customer_name").value = item.name || "";
+    $("quote_customer_code").value = item.code || "";
+  } else if (kind === "product") {
+    quoteFields.product = item;
+    $("quote_product_name").value = item.name || "";
+    $("quote_product_code").value = item.code || "";
+    if (!$("quote_retail_price").value && item.price) $("quote_retail_price").value = item.price;
+  }
+}
+
+function applyQuoteFields(data, statusId) {
+  quoteFields = data.fields || {};
+  const f = quoteFields;
+  $("quote_customer_name").value = f.customer?.name || f.customer_query || "";
+  $("quote_customer_code").value = f.customer?.code || f.customer_code || "";
+  $("quote_staff_name").value = f.staff_name || "";
+  $("quote_date").value = f.quote_date || "";
+  $("quote_product_name").value = f.product?.name || f.product_query || "";
+  $("quote_product_code").value = f.product?.code || f.product_code || "";
+  $("quote_quantity").value = f.quantity || 1;
+  $("quote_stock_status").value = f.stock_status || "";
+  $("quote_retail_price").value = f.retail_price || "";
+  $("quote_wholesale_price").value = f.wholesale_price || "";
+  $("quote_discounted_price").value = f.discounted_price || "";
+  $("quote_discount_name").value = f.discount_name || "";
+  $("quote_discount_rate").value = f.discount_rate || "";
+  $("quote_production_date").value = f.production_date || "";
+  $("quote_ship_date").value = f.ship_date || "";
+  $("quote_note").value = f.note || f.production_text || f.ship_text || "";
+  fillSelect("quote_customer_candidates", f.customer_candidates, f.customer?.code);
+  fillSelect("quote_product_candidates", f.product_candidates, f.product?.code);
+  $("quote_customer_match").innerHTML = f.customer ? `${f.customer_needs_confirmation ? '<span class="confirm">候補確認が必要です。</span> ' : ''}一致度 ${f.customer.score}` : "候補なし";
+  $("quote_product_match").innerHTML = f.product ? `${f.product_needs_confirmation ? '<span class="confirm">候補確認が必要です。</span> ' : ''}一致度 ${f.product.score}` : "候補なし";
+  const warnings = [];
+  if (f.customer_needs_confirmation) warnings.push("得意先");
+  if (f.product_needs_confirmation) warnings.push("製品");
+  setStatus(statusId, `解析完了 (${data.parser})${warnings.length ? "\\n確認してください: " + warnings.join("、") : ""}`);
+}
+
+$("quote_customer_candidates").onchange = (e) => applyCandidate("customer", e.target.value);
+$("quote_product_candidates").onchange = (e) => applyCandidate("product", e.target.value);
+
+function debounce(fn, wait) {
+  let timer;
+  return (...args) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn(...args), wait);
+  };
+}
+
+async function suggest(kind, query) {
+  if (!query || query.trim().length < 1) return;
+  const res = await fetch(`/api/suggest?kind=${encodeURIComponent(kind)}&q=${encodeURIComponent(query)}`);
+  const data = await res.json();
+  if (!res.ok) return;
+  quoteFields[`${kind}_candidates`] = data.candidates || [];
+  quoteFields[`${kind}_needs_confirmation`] = data.needs_confirmation;
+  fillSelect(`quote_${kind}_candidates`, data.candidates, data.candidates?.[0]?.code);
+  const first = data.candidates?.[0];
+  const label = $(`quote_${kind}_match`);
+  label.innerHTML = first ? `${data.needs_confirmation ? '<span class="confirm">候補確認が必要です。</span> ' : ''}一致度 ${first.score}` : "候補なし";
+}
+
+$("quote_customer_name").addEventListener("input", debounce((e) => suggest("customer", e.target.value), 250));
+$("quote_product_name").addEventListener("input", debounce((e) => suggest("product", e.target.value), 250));
+
+$("quoteListenBtn").onclick = () => {
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SpeechRecognition) {
+    setStatus("quoteSpeechStatus", "このブラウザはWeb Speech APIに未対応です。ChromeまたはEdgeで開いてください。");
+    return;
+  }
+  const rec = new SpeechRecognition();
+  rec.lang = "ja-JP";
+  rec.interimResults = true;
+  rec.continuous = true;
+  $("quoteListenBtn").disabled = true;
+  setStatus("quoteSpeechStatus", "聞き取り中... 最大60秒、20秒無音で自動停止します。");
+  let stoppedByTimer = "";
+  let stoppedByError = false;
+  let maxTimer = null;
+  let silenceTimer = null;
+  const stopListening = (reason) => {
+    stoppedByTimer = reason;
+    try { rec.stop(); } catch (_) {}
+  };
+  const resetSilenceTimer = () => {
+    clearTimeout(silenceTimer);
+    silenceTimer = setTimeout(() => stopListening("20秒無音だったため停止しました。"), 20 * 1000);
+  };
+  maxTimer = setTimeout(() => stopListening("60秒に達したため停止しました。"), 60 * 1000);
+  resetSilenceTimer();
+  rec.onresult = (event) => {
+    resetSilenceTimer();
+    let text = "";
+    for (let i = 0; i < event.results.length; i++) text += event.results[i][0].transcript;
+    $("quoteText").value = text;
+  };
+  rec.onspeechstart = resetSilenceTimer;
+  rec.onsoundstart = resetSilenceTimer;
+  rec.onerror = (event) => {
+    stoppedByError = true;
+    clearTimeout(maxTimer);
+    clearTimeout(silenceTimer);
+    $("quoteListenBtn").disabled = false;
+    setStatus("quoteSpeechStatus", "音声入力エラー: " + event.error);
+  };
+  rec.onend = () => {
+    clearTimeout(maxTimer);
+    clearTimeout(silenceTimer);
+    $("quoteListenBtn").disabled = false;
+    if (stoppedByError) return;
+    setStatus("quoteSpeechStatus", `${stoppedByTimer || "聞き取り完了。"} 必要なら文章を修正してから反映してください。`);
+  };
+  rec.start();
+};
+
+$("quoteParseBtn").onclick = async () => {
+  setStatus("quoteSpeechStatus", "解析中...");
+  const res = await fetch("/api/quote/parse", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ text: $("quoteText").value })
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    setStatus("quoteSpeechStatus", data.error || "解析に失敗しました。");
+    return;
+  }
+  applyQuoteFields(data, "quoteSpeechStatus");
+};
+
+$("quoteImageParseBtn").onclick = async () => {
+  const file = $("quoteImage").files[0];
+  if (!file) {
+    setStatus("quoteImageStatus", "見積依頼写真を選択してください。");
+    return;
+  }
+  setStatus("quoteImageStatus", "画像を読み取り中...");
+  const form = new FormData();
+  form.append("image", file);
+  const res = await fetch("/api/quote/parse-image", { method: "POST", body: form });
+  const data = await res.json();
+  if (!res.ok) {
+    setStatus("quoteImageStatus", data.error || "画像読み取りに失敗しました。");
+    return;
+  }
+  applyQuoteFields(data, "quoteImageStatus");
+};
+
+function collectQuoteFields() {
+  return {
+    ...quoteFields,
+    customer: { ...(quoteFields.customer || {}), name: $("quote_customer_name").value, code: $("quote_customer_code").value },
+    product: { ...(quoteFields.product || {}), name: $("quote_product_name").value, code: $("quote_product_code").value },
+    customer_name: $("quote_customer_name").value,
+    customer_code: $("quote_customer_code").value,
+    staff_name: $("quote_staff_name").value,
+    quote_date: $("quote_date").value,
+    product_name: $("quote_product_name").value,
+    product_code: $("quote_product_code").value,
+    quantity: $("quote_quantity").value,
+    stock_status: $("quote_stock_status").value,
+    retail_price: $("quote_retail_price").value,
+    wholesale_price: $("quote_wholesale_price").value,
+    discounted_price: $("quote_discounted_price").value,
+    discount_name: $("quote_discount_name").value,
+    discount_rate: $("quote_discount_rate").value,
+    production_date: $("quote_production_date").value,
+    ship_date: $("quote_ship_date").value,
+    note: $("quote_note").value
+  };
+}
+
+async function saveQuote(kind) {
+  setStatus("quoteSaveStatus", "Excel保存中...");
+  const res = await fetch(`/api/quote/save-${kind}`, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ fields: collectQuoteFields() })
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    setStatus("quoteSaveStatus", data.error || "保存に失敗しました。");
+    return;
+  }
+  setStatus("quoteSaveStatus", "保存しました: " + data.path);
+  const a = document.createElement("a");
+  a.href = data.download_url;
+  a.textContent = "保存したExcelをダウンロード";
+  a.style.display = "block";
+  a.style.marginTop = "8px";
+  $("quoteSaveStatus").appendChild(a);
+}
+
+$("quoteEstimateSaveBtn").onclick = () => saveQuote("estimate");
+$("quoteRequestSaveBtn").onclick = () => saveQuote("request");
+</script>
+</body>
+</html>
+"""
+
+
 @app.get("/")
 def index():
     return HTML
+
+
+@app.get("/quote")
+def quote_index():
+    return QUOTE_HTML
 
 
 @app.after_request
@@ -1387,6 +2122,86 @@ def api_save():
     path = save_excel(fields)
     token = create_download_token(path)
     audit("excel_saved", file=path.name)
+    return jsonify({"path": str(path), "download_url": f"/download/{token}"})
+
+
+@app.post("/api/quote/parse")
+def api_quote_parse():
+    payload = json_payload()
+    if payload is None:
+        return jsonify({"error": "JSON形式が正しくありません。"}), 400
+    text = str(payload.get("text", "")).strip()
+    if not text:
+        return jsonify({"error": "見積依頼テキストが空です。"}), 400
+    if len(text) > max_text_chars():
+        audit("quote_parse_text_too_long", length=len(text), limit=max_text_chars())
+        return jsonify({"error": f"入力が長すぎます。{max_text_chars()}文字以内にしてください。"}), 400
+
+    api_key = os.getenv("GEMINI_API_KEY", "")
+    parsed = parse_quote_with_gemini(text, api_key) if api_key else None
+    parser = "Gemini API" if parsed else "local parser"
+    if not parsed:
+        parsed = quote_local_parse(text)
+    fields = resolve_quote_fields(parsed)
+    return jsonify({"parser": parser, "fields": fields})
+
+
+@app.post("/api/quote/parse-image")
+def api_quote_parse_image():
+    api_key = os.getenv("GEMINI_API_KEY", "")
+    if not api_key:
+        return jsonify({"error": "画像読み取りには環境変数 GEMINI_API_KEY が必要です。設定してアプリを再起動してください。"}), 400
+    file = flask_request.files.get("image")
+    if not file:
+        return jsonify({"error": "画像ファイルがありません。"}), 400
+    suffix = Path(file.filename or "").suffix.lower()
+    mime_type = file.mimetype or mimetypes.guess_type(file.filename or "")[0] or ""
+    if suffix not in ALLOWED_UPLOAD_EXTENSIONS:
+        audit("quote_upload_rejected_extension", suffix=suffix)
+        return jsonify({"error": "許可されていないファイル形式です。jpg/png/webp/pdf を使ってください。"}), 400
+    if not (mime_type.startswith(ALLOWED_UPLOAD_MIME_PREFIXES) or mime_type in ALLOWED_UPLOAD_MIME_TYPES):
+        audit("quote_upload_rejected_mime", mime=mime_type)
+        return jsonify({"error": "許可されていないファイル形式です。"}), 400
+    image_bytes = file.read()
+    if not image_bytes:
+        return jsonify({"error": "画像ファイルが空です。"}), 400
+    if not allowed_upload_signature(image_bytes, suffix):
+        audit("quote_upload_rejected_signature", suffix=suffix, mime=mime_type)
+        return jsonify({"error": "ファイルの中身が拡張子と一致しません。jpg/png/webp/pdf を使ってください。"}), 400
+
+    audit("quote_image_parse_requested", filename=Path(file.filename or "upload").name, size=len(image_bytes), mime=mime_type)
+    parsed = parse_quote_image_with_gemini(image_bytes, file.filename or "quote.jpg", api_key)
+    if not parsed:
+        return jsonify({"error": "Gemini APIで画像を読み取れませんでした。画像の明るさ、ピント、APIキーを確認してください。"}), 400
+    fields = resolve_quote_fields(parsed)
+    return jsonify({"parser": "Gemini Vision", "fields": fields})
+
+
+@app.post("/api/quote/save-estimate")
+def api_quote_save_estimate():
+    payload = json_payload()
+    if payload is None:
+        return jsonify({"error": "JSON形式が正しくありません。"}), 400
+    fields = payload.get("fields") or {}
+    if not isinstance(fields, dict):
+        return jsonify({"error": "保存データの形式が正しくありません。"}), 400
+    path = save_quote_estimate_excel(fields)
+    token = create_download_token(path)
+    audit("quote_estimate_saved", file=path.name)
+    return jsonify({"path": str(path), "download_url": f"/download/{token}"})
+
+
+@app.post("/api/quote/save-request")
+def api_quote_save_request():
+    payload = json_payload()
+    if payload is None:
+        return jsonify({"error": "JSON形式が正しくありません。"}), 400
+    fields = payload.get("fields") or {}
+    if not isinstance(fields, dict):
+        return jsonify({"error": "保存データの形式が正しくありません。"}), 400
+    path = save_quote_request_excel(fields)
+    token = create_download_token(path)
+    audit("quote_request_saved", file=path.name)
     return jsonify({"path": str(path), "download_url": f"/download/{token}"})
 
 

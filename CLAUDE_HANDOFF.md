@@ -224,6 +224,29 @@ For direct public HTTPS, see:
 public_deploy_checklist.md
 ```
 
+## Quote Request / Estimate Feature
+
+Added `/quote` for quote request handling, parallel to the inquiry form.
+
+Scope:
+
+- Read quote requests from voice/text or photos.
+- Generate both an OREC-style estimate Excel and a quote-request copy Excel.
+- Excluded by user request: response deadline, freight, payment terms, FAX status.
+
+Fields kept:
+
+- Customer name/code, staff name, quote date, product name/code, quantity, retail price, wholesale price, discounted price, discount name/rate, stock status, production date, ship date, note.
+
+Learned quote rules:
+
+- `伊藤産業機械` -> customer `61105`.
+- `大竹産業` -> customer `61323`.
+- Models such as `AM64B`, `RM832A`, `SP853A`, `RCSP540`, `AM65B` resolve through the product master.
+- Ignore boilerplate estimate text such as production-date disclaimer, product-not-reserved notice, and standard greeting.
+- Move `在庫限り` into stock status rather than leaving it in notes.
+- Preserve business notes such as `入札案件です 6/1(月)早めに返信願います` and `8月以降で回答していい？`.
+
 ## Next Best Tasks
 
 1. Move HTML out of `app.py` into templates/static files.

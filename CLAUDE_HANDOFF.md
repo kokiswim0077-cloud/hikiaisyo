@@ -150,6 +150,36 @@ Validated sample result:
 - Warehouse: `011`
 - Shipping date: `2026-06-29`
 
+## Additional Image Rules Learned
+
+Validated on four real sample images on 2026-06-28.
+
+1. Kubota shipping instruction, Ichihara office:
+   - Kubota office code `038` or `市原営業所` -> delivery `61110004`.
+   - Model `WMC747AP/M` -> product `0358-0120`.
+   - Lower remarks can include both shipping and production dates:
+     `7/7(火)出荷`, `7/3(金)生産`.
+
+2. OREC inquiry sheet / 良栄社商会:
+   - Customer/delivery code `61376`.
+   - Product `HR403` can resolve to `0365-0020`.
+   - Handwritten note such as `24日出荷希望です` should drive shipping date.
+
+3. General order sheet / 木嶋商店:
+   - Right-side seller/orderer `有限会社 木嶋商店` -> customer `61310`.
+   - If no separate delivery is present, delivery also `61310`.
+   - `RM983FX/K` -> product `0347-0210`.
+   - Month-only notes should be preserved as text:
+     `生産日 8月` -> `H5 = 8月`,
+     `出荷予定日 2026年9月` -> `I6 = 2026年 9月`.
+
+4. 受注・発注カード / エルタ:
+   - Right-side company `株式会社エルタ` is the customer, even if the table has another `得意先名`.
+   - `エルタ` -> customer `65137`.
+   - If no direct delivery is present, delivery also `65137`.
+   - `RCHR800A` -> product `0372-0180`.
+   - `出荷予定日 2026年10月以降` should be preserved as text in the shipping cell.
+
 ## Known Recent Fixes
 
 - Gemini API now reads `.env` using `utf-8-sig` because PowerShell wrote BOM.

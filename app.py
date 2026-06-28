@@ -358,6 +358,13 @@ def infer_product_query(text: str) -> str:
     return best_token if best_score >= 0.65 else ""
 
 
+def model_tokens_from_text(text: str) -> list[str]:
+    normalized = unicodedata.normalize("NFKC", text or "").upper()
+    tokens = re.findall(r"\b[A-Z]{1,5}\d{2,4}[A-Z]{0,3}(?:/[A-Z0-9]+)?\b", normalized)
+    # Prefer more specific tokens first: RCHR800A before RCHR800, RM983FX before RM983.
+    return sorted(dict.fromkeys(tokens), key=len, reverse=True)
+
+
 def parse_date(text: str, label_patterns: list[str]) -> str:
     fragment = extract_labeled_fragment(
         text,
@@ -391,8 +398,9 @@ def resolve_default_dates(parsed: dict[str, object]) -> dict[str, object]:
 
     production_date = str(result.get("production_date") or "")
     ship_date = str(result.get("ship_date") or "")
+    ship_text = str(result.get("ship_text") or "")
     production_dt = date_from_iso(production_date)
-    if not ship_date and production_dt:
+    if not ship_date and not ship_text and production_dt:
         result["ship_date"] = add_business_days(production_dt, 2).strftime("%Y-%m-%d")
     return result
 
@@ -517,19 +525,34 @@ def parse_image_with_gemini(image_bytes: bytes, filename: str, api_key: str) -> 
 品名・型式・品番から製品候補を読み取ってください。得意先と納入先が同じとは限りません。
 
 キー:
-customer_query, customer_code, delivery_query, delivery_code, delivery_office_name, delivery_office_code, order_date, production_date, ship_date, warehouse, discount_name, discount_method, discount_rate, product_query, product_code, quantity, order_no
+document_type, issuer_query, visible_text, customer_query, customer_code, delivery_query, delivery_code, delivery_office_name, delivery_office_code, order_date, production_date, production_text, ship_date, ship_text, warehouse, discount_name, discount_method, discount_rate, product_query, product_code, quantity, order_no
 
 warehouseは011または031。不明なら空文字。
 discount_methodは外掛または内掛。不明なら空文字。
 discount_nameは台数値引、不需要期値引、実演機対応値引などの値引名。不明なら空文字。
 discount_rateは3%なら3。
 quantityは数値。
+production_date/ship_dateは日まで読める場合だけYYYY-MM-DD。月だけの場合は production_text/ship_text に「8月」「2026年9月」「2026年10月以降」のように入れる。
+issuer_queryは帳票右上や発行元に書かれた会社名。visible_textは判断に重要な見出し・会社名・備考欄だけを短くまとめる。
 
 クボタの「注文書（出荷指示書）」形式の場合:
 - 右上に株式会社クボタ、得意先名に関東甲信クボタがある場合は、customer_queryは「関東甲信クボタ（千葉県）」として扱う。
 - 「納所名」「納所コード」「届先」欄を重視する。例: 納所名が「大網営業所」なら delivery_office_name は「大網営業所」。
 - 下部の備考欄に「011倉庫」「6/29(月)出荷」のような手書き/赤字がある場合、warehouseとship_dateはそこから読む。
 - 商品は「形式名」「型式名」「商品名」欄を重視する。例: RM953X/K。
+
+オーレックの「引き合い内容連絡書」形式の場合:
+- 得意先NO/納入先NOを優先する。
+- 出荷希望日が手書き備考にある場合はそこを優先する。
+
+一般の「注文書」形式の場合:
+- 右上に書かれた注文元会社を customer_query として読む。例: 有限会社 木嶋商店。
+- 備考欄に「生産日 8月」「出荷予定日 2026年9月」のように月だけがある場合、production_text/ship_text に入れる。
+
+「受注・発注カード」形式の場合:
+- 右上の会社名を得意先として読む。例: 株式会社エルタ。
+- 表内の得意先名や直送先名は納入先・直送先の候補であり、得意先として優先しない。
+- 備考欄に「出荷予定日 2026年 10月 以降」のように月だけがある場合、ship_text に入れる。
 """.strip()
     body = {
         "contents": [
@@ -593,9 +616,19 @@ def kubota_order_overrides(parsed: dict[str, object]) -> dict[str, object]:
 
     office_name = str(result.get("delivery_office_name") or result.get("delivery_query") or "")
     office_code = str(result.get("delivery_office_code") or "").strip().zfill(3)
-    if "大網" in office_name or "大網" in blob or office_code == "040":
-        result["delivery_code"] = "61110005"
-        result["delivery_query"] = "関東甲信クボタ 大網営業所"
+    kubota_office_codes = {
+        "038": ("61110004", "関東甲信クボタ 市原営業所"),
+        "040": ("61110005", "関東甲信クボタ 大網営業所"),
+    }
+    if "大網" in office_name or "大網" in blob:
+        office_code = "040"
+    elif "市原" in office_name or "市原" in blob:
+        office_code = "038"
+
+    if office_code in kubota_office_codes:
+        delivery_code, delivery_query = kubota_office_codes[office_code]
+        result["delivery_code"] = delivery_code
+        result["delivery_query"] = delivery_query
         result["delivery_force_confirmed"] = True
 
     product_query = str(result.get("product_query") or "")
@@ -613,9 +646,35 @@ def kubota_order_overrides(parsed: dict[str, object]) -> dict[str, object]:
     return result
 
 
+def known_form_overrides(parsed: dict[str, object]) -> dict[str, object]:
+    result = dict(parsed)
+    blob = " ".join(str(value or "") for value in result.values())
+
+    if "木嶋" in blob or "木島" in blob:
+        result["customer_code"] = "61310"
+        result["customer_query"] = "木嶋商店"
+        result["customer_force_confirmed"] = True
+        if not result.get("delivery_code"):
+            result["delivery_code"] = "61310"
+            result["delivery_query"] = "木嶋商店"
+            result["delivery_force_confirmed"] = True
+
+    if "エルタ" in blob or "ｴﾙﾀ" in blob:
+        result["customer_code"] = "65137"
+        result["customer_query"] = "エルタ"
+        result["customer_force_confirmed"] = True
+        if not result.get("delivery_code"):
+            result["delivery_code"] = "65137"
+            result["delivery_query"] = "エルタ"
+            result["delivery_force_confirmed"] = True
+
+    return result
+
+
 def resolve_fields(parsed: dict[str, object]) -> dict[str, object]:
     parsed = sanitize_parsed(parsed)
     parsed = kubota_order_overrides(parsed)
+    parsed = known_form_overrides(parsed)
     parsed = resolve_default_dates(parsed)
     exact_customer = row_by_code(MASTER["customers"], parsed.get("customer_code"))
     if exact_customer:
@@ -646,7 +705,16 @@ def resolve_fields(parsed: dict[str, object]) -> dict[str, object]:
     if exact_product:
         product_candidates = [exact_product]
     else:
-        product_candidates = ranked_matches(str(parsed.get("product_query", "")), MASTER["products"], ("name", "code"))
+        product_search_text = " ".join(
+            str(parsed.get(key, "") or "")
+            for key in ["product_code", "product_query", "visible_text"]
+        )
+        token_candidates = []
+        for token in model_tokens_from_text(product_search_text):
+            token_candidates = ranked_matches(token, MASTER["products"], ("name", "code"))
+            if token_candidates and float(token_candidates[0].get("score", 0)) >= 0.9:
+                break
+        product_candidates = token_candidates or ranked_matches(str(parsed.get("product_query", "")), MASTER["products"], ("name", "code"))
     product = product_candidates[0] if product_candidates else None
 
     return {
@@ -682,8 +750,8 @@ def save_excel(fields: dict[str, object]) -> Path:
     ws["A4"] = customer.get("code", "")
     ws["A6"] = delivery.get("code", customer.get("code", ""))
     ws["I4"] = fields.get("order_date") or today().strftime("%Y-%m-%d")
-    ws["H5"] = fields.get("production_date") or "在庫"
-    ws["I6"] = fields.get("ship_date") or ""
+    ws["H5"] = fields.get("production_date") or fields.get("production_text") or "在庫"
+    ws["I6"] = fields.get("ship_date") or fields.get("ship_text") or ""
     ws["B17"] = fields.get("warehouse") or "011"
     ws["L7"] = fields.get("discount_name") or "音声入力値引"
     ws["L8"] = fields.get("discount_method") or "外掛"
@@ -694,7 +762,7 @@ def save_excel(fields: dict[str, object]) -> Path:
 
     ws["I4"].number_format = "yyyy-mm-dd"
     ws["H5"].number_format = "yyyy-mm-dd" if fields.get("production_date") else "@"
-    ws["I6"].number_format = "yyyy-mm-dd"
+    ws["I6"].number_format = "yyyy-mm-dd" if fields.get("ship_date") else "@"
     ws["B17"].number_format = "@"
     ws["N8"].number_format = "0.0"
 

@@ -22,6 +22,11 @@ Japanese voice/photo input web app for generating inquiry Excel files from an ex
 - Discount method is `外掛` or `内掛`.
 - Kubota `注文書（出荷指示書）` forms are handled with dedicated overrides:
   customer `61110`, `大網営業所` delivery `61110005`, and model-name product matching such as `RM953X/K` -> `0343-0210`.
+- Additional learned image rules:
+  `市原営業所` -> delivery `61110004`,
+  `木嶋商店` -> customer/delivery `61310`,
+  `エルタ` order cards -> customer/delivery `65137`,
+  and month-only production/shipping notes are preserved as text in the Excel output.
 
 ## Required Local Files
 

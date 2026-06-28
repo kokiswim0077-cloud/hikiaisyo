@@ -22,11 +22,6 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
 
 BASE_DIR = Path(__file__).resolve().parent
-SOURCE_BOOK = Path(os.getenv("INQUIRY_TEMPLATE", str(BASE_DIR / "template.xlsx")))
-OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", r"C:\Users\koki0\outputs\inquiry_voice_form"))
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-LOG_DIR = Path(os.getenv("LOG_DIR", str(BASE_DIR / "logs")))
-LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def load_local_env() -> None:
@@ -45,6 +40,39 @@ def load_local_env() -> None:
 
 
 load_local_env()
+
+
+def default_google_drive_output_dir() -> Path | None:
+    user_profile = Path(os.getenv("USERPROFILE", str(Path.home())))
+    candidates = [
+        user_profile / "Google Drive",
+        user_profile / "My Drive",
+        user_profile / "マイドライブ",
+        user_profile / "Google ドライブ",
+        Path(r"G:\マイドライブ"),
+        Path(r"G:\My Drive"),
+    ]
+    for root in candidates:
+        if root.exists():
+            return root / "引合書_見積書"
+    return None
+
+
+def resolve_output_dir() -> Path:
+    configured = os.getenv("OUTPUT_DIR") or os.getenv("GOOGLE_DRIVE_OUTPUT_DIR")
+    if configured:
+        return Path(configured)
+    google_dir = default_google_drive_output_dir()
+    if google_dir:
+        return google_dir
+    return Path(r"C:\Users\koki0\outputs\inquiry_voice_form")
+
+
+SOURCE_BOOK = Path(os.getenv("INQUIRY_TEMPLATE", str(BASE_DIR / "template.xlsx")))
+OUTPUT_DIR = resolve_output_dir()
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR = Path(os.getenv("LOG_DIR", str(BASE_DIR / "logs")))
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_UPLOAD_MB", "12")) * 1024 * 1024
@@ -1393,10 +1421,11 @@ async function loadStatus() {
   try {
     const res = await fetch("/api/status");
     const data = await res.json();
+    const outputText = data.output_dir ? `\n保存先: ${data.output_dir}` : "";
     if (data.gemini_configured) {
-      setStatus("imageStatus", `Gemini API 接続設定あり (${data.gemini_model})。注文書写真を読み取れます。`);
+      setStatus("imageStatus", `Gemini API 接続設定あり (${data.gemini_model})。注文書写真を読み取れます。${outputText}`);
     } else {
-      setStatus("imageStatus", "画像読み取りには GEMINI_API_KEY が必要です。");
+      setStatus("imageStatus", `画像読み取りには GEMINI_API_KEY が必要です。${outputText}`);
     }
   } catch {
     setStatus("imageStatus", "Gemini API の接続状態を確認できませんでした。");
@@ -1772,7 +1801,8 @@ async function statusCheck() {
   try {
     const res = await fetch("/api/status");
     const data = await res.json();
-    setStatus("quoteImageStatus", data.gemini_configured ? `Gemini API 接続設定あり (${data.gemini_model})。` : "画像読み取りには GEMINI_API_KEY が必要です。");
+    const outputText = data.output_dir ? `\n保存先: ${data.output_dir}` : "";
+    setStatus("quoteImageStatus", data.gemini_configured ? `Gemini API 接続設定あり (${data.gemini_model})。${outputText}` : `画像読み取りには GEMINI_API_KEY が必要です。${outputText}`);
   } catch (_) {
     setStatus("quoteImageStatus", "Gemini API の接続状態を確認できませんでした。");
   }
@@ -2054,6 +2084,8 @@ def api_status():
             "template_exists": SOURCE_BOOK.exists(),
             "max_upload_mb": int(os.getenv("MAX_UPLOAD_MB", "12")),
             "max_text_chars": max_text_chars(),
+            "output_dir": str(OUTPUT_DIR),
+            "google_drive_output": bool(default_google_drive_output_dir() and OUTPUT_DIR == default_google_drive_output_dir()),
         }
     )
 

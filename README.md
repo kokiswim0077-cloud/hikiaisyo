@@ -18,6 +18,7 @@ Japanese voice/photo input web app for generating inquiry Excel files from an ex
   `260628_得意先_機種名_見積書.xlsx`.
 - Quote request copy filenames use:
   `260628_得意先_機種名_見積依頼.xlsx`.
+- Output files are stored in Google Drive when a local Google Drive sync folder is detected, under `引合書_見積書`.
 
 ## Current Business Rules
 
@@ -66,6 +67,30 @@ INQUIRY_TEMPLATE=C:\secure\path\template.xlsx
 in `.env`.
 
 Keep repositories containing `template.xlsx` private unless the user explicitly approves publishing the workbook data.
+
+## Google Drive Storage
+
+Install Google Drive for desktop on the app host PC. The app auto-detects common sync folders such as:
+
+```text
+G:\マイドライブ
+G:\My Drive
+%USERPROFILE%\Google Drive
+```
+
+When detected, generated Excel files are saved under:
+
+```text
+引合書_見積書
+```
+
+If auto-detection does not find your folder, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\set_google_drive_output.ps1 "G:\マイドライブ"
+```
+
+Then restart the app.
 
 ## Setup
 

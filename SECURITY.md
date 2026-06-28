@@ -48,3 +48,12 @@ Do not install the Gemini key and real Excel template on every PC unless there i
 - Encrypt stored templates and outputs if the machine is shared.
 - Add a scheduled cleanup task for output/log retention.
 - Add monitored backups for the Excel template only.
+
+## Google Drive Storage
+
+Generated Excel files may be stored under a local Google Drive sync folder, usually `引合書_見積書`.
+
+- Keep this folder in My Drive or a restricted shared drive.
+- Do not make the folder public or link-shared broadly.
+- Use Google Drive permissions for access control, not file-name secrecy.
+- If multiple PCs use the app, prefer one app host writing to one Google Drive location.

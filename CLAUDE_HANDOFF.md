@@ -212,6 +212,8 @@ Other PCs -> browser -> Cloudflare Access/VPN/reverse proxy -> one app host
 
 Avoid distributing `.env`, Gemini key, and the real Excel template to every PC.
 
+Generated Excel files should be stored in Google Drive. The app now auto-detects common local Google Drive sync folders and saves under `引合書_見積書`; otherwise set `OUTPUT_DIR` or `GOOGLE_DRIVE_OUTPUT_DIR`. Use `set_google_drive_output.ps1` for manual setup.
+
 For Cloudflare, see:
 
 ```text
